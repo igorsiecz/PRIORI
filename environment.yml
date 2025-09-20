@@ -1,0 +1,34 @@
+name: priori-conda
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - gdal
+  - rasterio
+  - geopandas
+  - shapely
+  - pyproj
+  - cartopy
+  - pillow
+  - tk
+  - cairo
+  - pango
+  - scikit-image
+  - requests
+  - osmnx
+  - openpyxl
+  - qtpy
+  - pyqt
+  - fiona
+  - pip
+  - pip:
+      - whitebox
+      - earthengine-api
+      - pywebview
+      - customtkinter
+      - img2pdf
+      - cairosvg

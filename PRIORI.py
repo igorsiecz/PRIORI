@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 Igor Sieczkowski Moreira
+
+import re
 import sys
 import threading
 import time
@@ -53,6 +57,20 @@ from pyproj import Transformer
 import webbrowser
 
 
+# Garante visibilidade das DLLs (gdal/proj/geos) no Windows
+if sys.platform.startswith("win"):
+    env = sys.prefix  # caminho do env conda ativo
+    lib_bin = os.path.join(env, "Library", "bin")
+    gdal_data = os.path.join(env, "Library", "share", "gdal")
+    proj_lib = os.path.join(env, "Library", "share", "proj")
+    os.environ["PATH"] = lib_bin + os.pathsep + os.environ.get("PATH", "")
+    try:
+        os.add_dll_directory(lib_bin)
+    except Exception:
+        pass
+    os.environ["GDAL_DATA"] = gdal_data
+    os.environ["PROJ_LIB"] = proj_lib
+
 # Inicializa tema do customtkinter
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -86,7 +104,7 @@ best = "Icons/best.png"
 update = "Icons/update.png"
 info = "Icons/info.png"
 check = "Icons/check.png"
-alerta = "Icons/alerta.png"
+alerta = "Icons/alert.png"
 error = "Icons/error.png"
 logo = "Icons/logo_horizontal.png"
 logo_ico = "Icons/logo_ico.ico"
@@ -976,18 +994,79 @@ def calculate_HAND(filled_path, drainage_path, output_path):
     print("✅ HAND calculado com sucesso")
 
 
+def _find_saga_cmd():
+    hint = os.environ.get("SAGA_CMD")
+    if hint:
+        if os.path.isdir(hint):
+            c = os.path.join(hint, "saga_cmd.exe")
+            if os.path.isfile(c):
+                return c
+        elif os.path.isfile(hint):
+            return hint
+    candidates = [
+        os.path.join(sys.prefix, "Library", "bin", "saga_cmd.exe"),
+        os.path.join(sys.prefix, "bin", "saga_cmd.exe"),
+        os.path.join(sys.prefix, "Scripts", "saga_cmd.exe"),
+    ]
+    candidates += [
+        r"C:\OSGeo4W64\bin\saga_cmd.exe",
+        r"C:\OSGeo4W\bin\saga_cmd.exe",
+        r"C:\Program Files\SAGA-GIS\saga_cmd.exe",
+        r"C:\Program Files\SAGA GIS LTR\saga_cmd.exe",
+        r"C:\Users\igors\Documents\saga-9.8.0_x64\saga_cmd.exe",  # seu local
+    ]
+    which = shutil.which("saga_cmd.exe") or shutil.which("saga_cmd")
+    if which:
+        candidates.insert(0, which)
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    raise FileNotFoundError(
+        "saga_cmd.exe não encontrado.\n"
+        "Defina SAGA_CMD com o caminho para saga_cmd.exe ou instale SAGA (OSGeo/standalone)."
+    )
+
+def _detect_mrvbf_tool_id(saga_cmd_path: str) -> str:
+    try:
+        out = subprocess.run([saga_cmd_path, "ta_morphometry", "-h"],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, check=True).stdout
+        m = re.search(r'\[(\d+)\]\s.*MRVBF', out, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return "8"
+
 def calcular_mrvbf(dem_path, output_path):
     print("\n⚙️ Calculando o MRVBF...")
+    if sys.platform.startswith("win"):
+        lib_bin = os.path.join(sys.prefix, "Library", "bin")
+        os.environ["PATH"] = lib_bin + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(lib_bin)
+        except Exception:
+            pass
+        os.environ["GDAL_DATA"] = os.path.join(sys.prefix, "Library", "share", "gdal")
+        os.environ["PROJ_LIB"]  = os.path.join(sys.prefix, "Library", "share", "proj")
     base_dir = os.path.dirname(__file__)
     input_dem = os.path.join(base_dir, dem_path)
     mrvbf_out = os.path.join(base_dir, output_path)
-    cmd = ["saga_cmd", "ta_morphometry", "8", "-DEM", input_dem, "-MRVBF", mrvbf_out]
+    os.makedirs(os.path.dirname(mrvbf_out), exist_ok=True)
+    saga_cmd = _find_saga_cmd()
+    print("SAGA_CMD =", saga_cmd)  # debug útil
+    subprocess.run([saga_cmd, "--version"], check=True,
+                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    tool_id = _detect_mrvbf_tool_id(saga_cmd)
+    cmd = [saga_cmd, "ta_morphometry", tool_id,
+           "-DEM", input_dem,
+           "-MRVBF", mrvbf_out]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         print("❌ Erro ao calcular MRVBF com SAGA GIS:")
-        print(result.stderr)
-        raise RuntimeError("Falha na execução do SAGA GIS.")
-    print(f"✅ MRVBF gerado com sucesso")
+        print(result.stderr.strip() or result.stdout)
+        raise RuntimeError("Falha na execução do SAGA GIS (MRVBF).")
+    print(f"✅ MRVBF gerado com sucesso: {mrvbf_out}")
     log(pasta, f"File: {output_path} — Raw MRVBF values")
     return mrvbf_out
 
@@ -2059,7 +2138,7 @@ def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng):
     print("\n⚙️ Carregando dados do censo...")
     log(pin, "Census Analysis", color="black", font_size=14, font_weight="bold", icon_size=14)
     spinner = log_loading(loading, "Loading census data...")
-    census = gpd.read_file(path_census)
+    census = gpd.read_file(path_census, engine="fiona")
     spinner()
     print("✅ Censo carregado com sucesso")
 

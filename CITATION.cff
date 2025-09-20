@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+title: PRIORI
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Moreira
+    given-names: Igor Sieczkowski
+    orcid: "https://orcid.org/0000-0000-0000-0000"   # troque
+repository-code: "https://github.com/igorsiecz/PRIORI"
+license: Apache-2.0
+version: 1.0.0
+date-released: 2025-09-19
