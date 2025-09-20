@@ -1,6 +1,6 @@
 # PRIORI - Protocol for Road Infrastructure Operational Risk due to Inundation
 
-[![Version](https://img.shields.io/github/v/tag/igorsiecz/PRIORI?label=version&sort=semver)](https://github.com/igorsiecz/PRIORI/releases)
+[![Version](https://img.shields.io/github/v/tag/igorsiecz/PRIORI?label=version&sort=semver&cacheSeconds=120)](https://github.com/igorsiecz/PRIORI/releases)
 
 *A GIS-based framework to quantify flood-related **operational risk** in road networks — integrating geomorphological susceptibility, multi‑criteria road vulnerability, and risk mapping.*
 
