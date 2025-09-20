@@ -1,0 +1,21 @@
+{
+  "upload_type": "software",
+  "title": "PRIORI",
+  "description": "Protocol for Road Infrastructure Operational Risk due to Inundation",
+  "creators": [
+    {
+      "name": "Moreira, Igor Sieczkowski",
+      "orcid": "0000-0001-8101-6669",
+      "affiliation": "UFRGS / LAPAV"
+    }
+  ],
+  "license": "Apache-2.0",
+  "keywords": ["GIS", "flood risk", "road networks", "geomorphology", "geospatial", "Python"],
+  "related_identifiers": [
+    {
+      "relation": "isSupplementTo",
+      "identifier": "https://github.com/igorsiecz/PRIORI"
+    }
+  ],
+  "notes": "See CITATION.cff for citation info. Changelog in CHANGELOG.md."
+}
