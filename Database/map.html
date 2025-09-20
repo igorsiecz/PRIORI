@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"/>
+  <title>Select Region</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <!-- Leaflet.draw -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw/dist/leaflet.draw.css"/>
+  <script src="https://unpkg.com/leaflet-draw/dist/leaflet.draw.js"></script>
+
+  <!-- Turf.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    html, body, #map { margin:0; padding:0; width:100%; height:100vh; }
+    #buttons {
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      z-index: 1000;
+    }
+    button {
+      font-family: sans-serif;
+      font-size: 14px;
+      padding: 8px 14px;
+      margin: 4px;
+      border: none;
+      border-radius: 6px;
+      background-color: #0078d7;
+      color: white;
+      cursor: pointer;
+    }
+    button:hover { background-color: #005a9e; }
+    #toast {
+      visibility: hidden;
+      min-width: 250px;
+      background-color: #333;
+      color: #fff;
+      text-align: center;
+      border-radius: 8px;
+      padding: 12px;
+      position: fixed;
+      z-index: 9999;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: sans-serif;
+    }
+    #toast.show {
+      visibility: visible;
+      animation: fadein 0.5s, fadeout 0.5s 2s;
+    }
+    @keyframes fadein { from { bottom:20px; opacity:0; } to { bottom:30px; opacity:1; } }
+    @keyframes fadeout { from { bottom:30px; opacity:1; } to { bottom:20px; opacity:0; } }
+  </style>
+</head>
+<body>
+
+  <div id="buttons">
+    <button onclick="clearSelection()">Clear selection</button>
+    <button onclick="proceed()">Proceed</button>
+  </div>
+  <div id="toast">📤 Coordinates sent successfully!</div>
+  <div id="map"></div>
+
+  <script>
+    const MAX_AREA_HA = 780000;
+    let selectedRectangle = null;
+    let drawingListener = null;
+
+    // 1) Inicializa o mapa
+    const map = L.map('map').setView([-14.2350, -51.9253], 4);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+      maxZoom:19
+    }).addTo(map);
+
+    // 2) Camada para shapes
+    const drawnItems = new L.FeatureGroup().addTo(map);
+
+    // 3) Controle de desenho/edição (sem circle/circlemarker)
+    const drawControl = new L.Control.Draw({
+      draw: {
+        rectangle: { shapeOptions: { color: 'green' } },
+        polygon: false,
+        polyline: false,
+        circle: false,
+        marker: false,
+        circlemarker: false
+      },
+      edit: {
+        featureGroup: drawnItems,
+        edit: true,
+        remove: true
+      }
+    });
+    map.addControl(drawControl);
+
+    // 4) Recolorir conforme área
+    function updateRectangleArea(layer) {
+      const ha = turf.area(layer.toGeoJSON()) / 10000;
+      layer.setStyle({ color: ha > MAX_AREA_HA ? 'red' : 'green' });
+    }
+
+    // 5) REAL‑TIME DURANTE O DESENHO
+    map.on('draw:drawstart', e => {
+      if (e.layerType === 'rectangle') {
+        const handler = drawControl._toolbars.draw._modes.rectangle.handler;
+        drawingListener = () => {
+          if (handler._shape) updateRectangleArea(handler._shape);
+        };
+        map.on('mousemove', drawingListener);
+      }
+    });
+    map.on('draw:drawstop', () => {
+      if (drawingListener) {
+        map.off('mousemove', drawingListener);
+        drawingListener = null;
+      }
+    });
+
+    // 6) AO CRIAR O RETÂNGULO FINAL
+    map.on('draw:created', e => {
+      // remove listener de desenho
+      if (drawingListener) {
+        map.off('mousemove', drawingListener);
+        drawingListener = null;
+      }
+      // remove anterior
+      if (selectedRectangle) drawnItems.removeLayer(selectedRectangle);
+
+      // adiciona novo
+      selectedRectangle = e.layer;
+      drawnItems.addLayer(selectedRectangle);
+      updateRectangleArea(selectedRectangle);
+    });
+
+    // 7) REAL‑TIME DURANTE A EDIÇÃO
+    map.on('draw:editmove draw:editresize draw:editvertex', () => {
+      if (selectedRectangle) updateRectangleArea(selectedRectangle);
+    });
+
+    // 8) AO DELETAR
+    map.on('draw:deleted', clearSelection);
+
+    // 9) UI helpers
+    function clearSelection() {
+      drawnItems.clearLayers();
+      selectedRectangle = null;
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = "show";
+      setTimeout(() => t.className = t.className.replace("show",""), 2500);
+    }
+
+    function proceed() {
+      if (!selectedRectangle) {
+        alert("Please draw a rectangle to select a region.");
+        return;
+      }
+      const areaHa = turf.area(selectedRectangle.toGeoJSON()) / 10000;
+      const selectedFmt = areaHa.toLocaleString('pt-BR', { maximumFractionDigits: 0 });
+      const maxFmt = MAX_AREA_HA.toLocaleString('pt-BR', { maximumFractionDigits: 0 });
+      if (areaHa > MAX_AREA_HA) {
+        alert(`Selected area (${selectedFmt} ha) exceeds maximum area (${MAX_AREA_HA.toLocaleString()} ha).`);
+        return;
+      }
+      const b = selectedRectangle.getBounds();
+      pywebview.api.send_coordinates({
+        northEast: b.getNorthEast(),
+        southWest: b.getSouthWest()
+      })
+      .then(() => showToast("Coordinates sent successfully!"))
+      .catch(err => alert("Something went wrong: " + err));
+    }
+  </script>
+</body>
+</html>

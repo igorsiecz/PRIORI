@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# Se você preferir versionar amostras pequenas:
+# !Database/samples/**
+
+# Outras pastas/opcionais
+Icons/**.psd
+*.zip
+*.7z
+*.rar
