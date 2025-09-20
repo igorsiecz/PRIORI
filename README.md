@@ -1,96 +1,163 @@
-# PRIORI
-A GIS-based framework for quantifying flood-related operational risk in road networks, integrating geomorphological indices, socioeconomic conditions, and critical infrastructure exposure.
+# PRIORI - Protocol for Road Infrastructure Operational Risk due to Inundation
 
-## License
-Apache License 2.0 — see `LICENSE` (and `NOTICE`).
+[![Version](https://img.shields.io/github/v/tag/igorsiecz/PRIORI?label=version&sort=semver)](https://github.com/igorsiecz/PRIORI/releases)
 
-## Citation
+*A GIS-based framework to quantify flood-related **operational risk** in road networks — integrating geomorphological susceptibility, multi‑criteria road vulnerability, and risk mapping.*
 
-- Cite this software using the repository’s `CITATION.cff` (if present) and/or the DOI of the release archived on Zenodo.
-- Cite external datasets (e.g., census, OSM, elevation models) according to their original licenses and attribution requirements.
+> **Project origin & funding**
+>
+> **PRIORI** was developed during the M.Sc. of **Igor Sieczkowski Moreira**, advised by **Prof. Lélio Antônio Teixeira Brito** and co-advised by **Prof. Fernando Dornelles**, within the **Graduate Program in Civil Engineering: Construction and Infrastructure (PPGCI)** at **Universidade Federal do Rio Grande do Sul (UFRGS), Brazil**. The research was supported by **CNPq** (Brazil’s National Council for Scientific and Technological Development), scholarship **process no. 131454/2023‑4**, under the **Academic Innovation Master’s** modality in partnership with **infraTest Prüftechnik GmbH (infraTest)**.
 
 ---
-# Initialization Guide
 
-## 1) Environment (Conda)
+## Why PRIORI?
 
-This project ships an `environment.yml` using **conda-forge** (stable for the geospatial stack).  
-To create/update:
+- **Data‑scarce ready.** Replaces unavailable hydrodynamics with **geomorphological proxies** (HAND & MRVBF) to estimate flood *hazzard*.
+- **Road‑centric vulnerability.** Blends **social, economic, and functional** factors to score how critical a road segment is.
+- **End‑to‑end workflow.** Pulls inputs from **Google Earth Engine**, and processes everything with the **conda‑forge geospatial stack**.
+- **Reproducible & transparent.** Configuration is code‑first; all steps are documented for reuse and auditing.
+
+> **Scope.** PRIORI targets **operational** risk (service disruption potential), not physical asset fragility modelling. It is ideal for **screening**, **planning**, and **prioritization** at municipal–regional scales.
+
+---
+
+## Table of Contents
+
+1. [Quickstart](#quickstart)
+2. [Installation](#installation)
+   - [1) Clone the repo](#1-clone-the-repo)
+   - [2) Create the Conda environment](#2-create-the-conda-environment)
+   - [3) Install SAGA GIS (MRVBF)](#3-install-saga-gis-mrvbf)
+   - [4) Configure Google Earth Engine (Service Account)](#4-configure-google-earth-engine-service-account)
+3. [Data (Large Files via Git LFS)](#data-large-files-via-git-lfs)
+4. [Running](#running)
+5. [Windows GDAL/PROJ tips](#windows-gdalproj-tips)
+6. [Troubleshooting (FAQ)](#troubleshooting-faq)
+7. [Cite & License](#cite--license)
+8. [Acknowledgments](#acknowledgments)
+9. [Contributing](#contributing)
+
+---
+
+## Quickstart
 
 ```bash
-# create
+# 1) clone
+git clone https://github.com/<your-org-or-user>/PRIORI.git
+cd PRIORI
+
+# 2) conda env
 conda env create -f environment.yml
 conda activate priori-conda
 
-# update later if environment.yml changes
+# 3) (Windows) point PRIORI to SAGA CLI if needed
+#    e.g., PowerShell:
+setx SAGA_CMD "C:\Path\To\saga_cmd.exe"
+
+# 4) pull only the census file you need (see Data section for options)
+git lfs install --skip-smudge
+git lfs pull --include="BR_Census.gpkg" --exclude=""
+
+# 5) run
+python PRIORI.py
+```
+
+---
+
+## Installation
+
+### 1) Clone the repo
+```bash
+git clone https://github.com/igorsiecz/PRIORI.git
+cd PRIORI
+```
+
+### 2) Create the Conda environment
+This project ships an `environment.yml` pinned to **conda‑forge** for a stable geospatial stack.
+
+```bash
+conda env create -f environment.yml
+conda activate priori-conda
+
+# later updates
 conda env update -f environment.yml -n priori-conda
 ```
 
-**Tip (Windows):** prefer installing `gdal`, `rasterio`, `pyproj`, `geopandas`, `cartopy` via conda-forge (as in the YAML). Avoid `pip install` for those.
+> **Tip (Windows):** install **gdal, rasterio, pyproj, geopandas, cartopy** from *conda‑forge* (as declared in the YAML). Avoid `pip install` for those packages on Windows to prevent DLL issues.
 
----
+### 3) Install SAGA GIS (MRVBF)
+PRIORI runs **MRVBF** via the **SAGA GIS** command line (`saga_cmd`).
 
-## 2) External dependency — SAGA GIS (CLI)
+- Install SAGA GIS (official installer or OSGeo4W on Windows).
+- Find the full path to `saga_cmd` (e.g., `C:\OSGeo4W64\bin\saga_cmd.exe`).
 
-PRIORI uses the **MRVBF** tool from **SAGA GIS**. You need the **`saga_cmd`** CLI available on your system.
+Set the path so PRIORI can find it:
 
-### Install SAGA GIS
-- Use an official installer or a GIS distribution that includes SAGA (e.g., OSGeo4W on Windows), or the platform-specific installer.  
-- Locate the **full path** to `saga_cmd`:
-  - **Windows**: e.g. `C:\OSGeo4W64\bin\saga_cmd.exe` or the path where you installed SAGA.
-
-### Tell PRIORI where `saga_cmd` is:
-Set the `SAGA_CMD` environment variable:
-
-- **Windows (PowerShell)**:
+- **Windows (PowerShell, persistent):**
   ```powershell
-  setx SAGA_CMD "C:\path\to\saga_cmd.exe"
+  setx SAGA_CMD "C:\Path\To\saga_cmd.exe"
   ```
-  (restart your IDE/terminal after `setx`), or set it only for the current session:
+- **Current session only:**
   ```powershell
-  $env:SAGA_CMD = "C:\path\to\saga_cmd.exe"
+  $env:SAGA_CMD = "C:\Path\To\saga_cmd.exe"
   ```
+- **PyCharm:** *Run → Edit Configurations → Environment variables* → add `SAGA_CMD` with the full path.
 
-- **PyCharm (Run Configuration)**:  
-  *Run → Edit Configurations… → Environment variables → Add:*  
-  `SAGA_CMD = C:\path\to\saga_cmd.exe` *(or your system path)*
-
-> The code attempts auto-discovery (common install locations), but setting `SAGA_CMD` is the most reliable.
-
----
-
-## 3) Earth Engine (Service Account JSON)
-
-PRIORI accesses Google Earth Engine (EE). You’ll need a **Service Account** and its **JSON key**.
+### 4) Configure Google Earth Engine (Service Account)
+PRIORI reads some inputs from **Google Earth Engine (EE)**. Use a **Service Account** + **JSON key**.
 
 **Steps (summary):**
-1. Create/choose a Google Cloud project and **enable** the **Earth Engine API**.
-2. Create a **Service Account** and generate a **JSON key** (download the file).
+1. In Google Cloud, create or select a project and **enable the Earth Engine API**.
+2. Create a **Service Account** and **download** its **JSON key**.
 3. In Earth Engine, **grant the Service Account** access to the assets you will use.
 
-**Usage in PRIORI:**  
-At runtime, the program will ask for the Service Account **email** and prompt you to **select the `.json` key** file.
+**At runtime**, PRIORI will ask for the **Service Account e‑mail** and prompt you to **select the JSON key** file.
 
-Example of EE JSON structure:
+Example JSON (keys shortened):
 ```json
 {
   "type": "service_account",
   "project_id": "ee-yourproject",
-  "private_key_id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "private_key_id": "…",
   "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
   "client_email": "your-service@ee-yourproject.iam.gserviceaccount.com",
   "client_id": "1234567890",
-  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-  "token_uri": "https://oauth2.googleapis.com/token",
-  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/your-service%40ee-yourproject.iam.gserviceaccount.com",
-  "universe_domain": "googleapis.com"
+  "token_uri": "https://oauth2.googleapis.com/token"
 }
 ```
 
 ---
 
-## 4) Running
+## Data (Large Files via Git LFS)
+
+This repository ships **large census geodata** using **[Git LFS](https://git-lfs.com/)**. You can download **only what you need**.
+
+### Available LFS artifacts
+- `BR_Census.gpkg` — Brazilian census package
+
+### Download everything (default)
+```bash
+git lfs install
+git lfs pull
+```
+
+### Download selectively (recommended)
+1) Prevent auto‑downloading on clone:
+```bash
+git lfs install --skip-smudge
+```
+2) Pull just the target file(s):
+```bash
+git lfs pull --include="file_name" --exclude=""
+```
+
+> **Naming convention.** Files may follow the pattern **`CC_Census.gpkg`**, where **`CC`** is the **ISO 3166‑1 alpha‑2 country code** (e.g., `BR` for Brazil, `US` for United States). 
+
+> **Tip:** If you cloned earlier without `--skip-smudge`, run `git lfs fetch --include="BR_Census.gpkg" --exclude="" && git lfs checkout BR_Census.gpkg` to hydrate a single file locally.
+
+---
+
+## Running
 
 ### Terminal
 ```bash
@@ -99,78 +166,87 @@ python PRIORI.py
 ```
 
 ### PyCharm
-- Interpreter: your Conda env `.../envs/priori-conda/python.exe`
-- *Run → Edit Configurations…*:
-  - **Script path**: `<repo_root>/PRIORI.py`
-  - **Working directory**: `<repo_root>`
-  - **Environment variables**:
-    - Add `SAGA_CMD` if required (see above).
-    - If you face GDAL/PROJ DLL issues on Windows, add the variables from the next section.
+- **Interpreter:** your Conda env `…/envs/priori-conda/python.exe`
+- **Run → Edit Configurations:**
+  - **Script path:** `<repo_root>/PRIORI.py`
+  - **Working directory:** `<repo_root>`
+  - **Environment variables:**
+    - `SAGA_CMD` (if not on PATH)
+    - On Windows, consider adding the GDAL/PROJ variables below if you hit DLL errors.
 
 ---
 
-## 5) Windows + GDAL/PROJ (DLL guidance)
+## Windows GDAL/PROJ tips
 
-If you see an error like `ImportError: DLL load failed while importing _gdal`, use **one** of the approaches below.
+If you see `ImportError: DLL load failed while importing _gdal` or similar, set the following **Run Configuration env vars** (adjusting to your env path):
 
-**Configure Run Configuration env vars (recommended for IDE users)**
-
-Set these environment variables in your run configuration (replace with your env path):
-
-- **Windows:**
-  ```
-  PATH=%CONDA_PREFIX%\Library\bin;%PATH%
-  GDAL_DATA=%CONDA_PREFIX%\Library\share\gdal
-  PROJ_LIB=%CONDA_PREFIX%\Library\share\proj
-  ```
-
-> **Avoid mixing** conda-forge geospatial packages with `pip install` for `gdal`, `rasterio`, `pyproj`, `geopandas`, `cartopy` on Windows.
-
----
-
-## 6) Data (Large files)
-
-If the repository stores large datasets via **Git LFS**:
-
-```bash
-git lfs install
-git lfs pull
+```
+PATH=%CONDA_PREFIX%\Library\bin;%PATH%
+GDAL_DATA=%CONDA_PREFIX%\Library\share\gdal
+PROJ_LIB=%CONDA_PREFIX%\Library\share\proj
 ```
 
----
-
-## 7) GUI (pywebview)
-
-By default, `pywebview` may try a Qt backend. You have two options:
-
-- **Lightweight (Windows)**: force Edge WebView2 without extra packages:
-  ```python
-  import os
-  os.environ['PYWEBVIEW_GUI'] = 'edgechromium'
-  import webview
-  ```
-- **Qt backend**: install `qtpy` + `pyqt` (already present if listed in `environment.yml`).
+> Also avoid mixing conda‑forge geospatial packages with `pip install` counterparts on Windows.
 
 ---
 
-## 8) Troubleshooting (FAQ)
+## Troubleshooting (FAQ)
 
 **`FileNotFoundError [WinError 2]` when running MRVBF**  
-The `saga_cmd` executable was not found. Set `SAGA_CMD` to the full path (see “SAGA GIS” section).
+`SAGA_CMD` not found. Set it to the full path (see *Install SAGA GIS*).
 
-**`pyogrio.errors.DataSourceError: ... .gpkg not recognized`**  
-Confirm you have the **real** file (not a small Git LFS pointer).  
-Use `git lfs pull` or download the dataset.
+**`.gpkg not recognized` / tiny file size**  
+You likely have an **LFS pointer** instead of the real data. Run a selective `git lfs pull` for the specific file.
 
-**`ImportError: DLL load failed while importing _gdal`**  
-Add the env vars or the Windows snippet shown in “Windows + GDAL/PROJ”.
+**Earth Engine authentication fails**  
+- Make sure you’re using a **Service Account JSON** (not OAuth user token).
+- Ensure the Service Account has **read permissions** to every referenced asset.
 
-**Earth Engine authentication issues**  
-Ensure you are using a **Service Account** JSON and that the Service Account has **permissions** to read the assets you reference.
+**Long‑running MRVBF on large rasters**  
+- Consider tiling inputs or running on a higher‑performance machine.
+- Verify your SAGA version; newer builds may be faster and more stable.
+
+---
+
+## Cite & License
+
+- **License:** Apache License 2.0 — see `LICENSE` (and `NOTICE`).
+- **How to cite:** Use the repository’s `CITATION.cff` and/or the DOI of the archival release. Also cite external datasets (OSM, census, DEMs) per their original licenses and attribution.
+
+**Software citation:**
+> Moreira, I.S. (2025). PRIORI: A GIS‑based framework for flood‑related operational risk in road networks (Version 1.0.0) \[Software\]. GitHub. https://github.com/igorsiecz/PRIORI (and DOI of the archived release)
 
 ---
 
 ## Acknowledgments
 
-- Third-party icons and assets are listed in `NOTICE`.
-- Trademarks and institutional logos belong to their respective owners. No trademark rights are granted by this project.
+- **CNPq** scholarship **131454/2023‑4** (Brazil).  
+- **infraTest Prüftechnik GmbH (infraTest)** for the Academic Innovation partnership.  
+- UFRGS **PPGCI** graduate program and **LAPAV** lab community.  
+- Open‑source ecosystems: **conda‑forge**, **GDAL**, **PROJ**, **SAGA GIS**, **Rasterio**, **GeoPandas**, **pyogrio**, **OSMnx**, **WhiteboxTools**, and **Google Earth Engine**.
+
+---
+
+## Contributing
+
+Contributions are welcome! Please open an issue for bugs, feature requests, or documentation improvements.  
+For pull requests, follow conventional commits if possible and keep PRs focused and small.
+
+---
+
+### Appendix — Commands you might need
+
+**Update your fork/branch:**
+```bash
+git pull --rebase origin main
+```
+
+**Only (re)hydrate one LFS file you already fetched:**
+```bash
+git lfs checkout BR_Census.gpkg
+```
+
+**Update environment after YAML changes:**
+```bash
+conda env update -f environment.yml -n priori-conda
+```

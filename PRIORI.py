@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 Igor Sieczkowski Moreira
 
+# PRIORI.py
+__version__ = "1.0.0"
+
 import re
 import sys
 import threading
 import time
 from datetime import datetime
-from tkinter import filedialog
 from scipy.ndimage import distance_transform_edt
 from whitebox.whitebox_tools import WhiteboxTools
 import matplotlib.pyplot as plt
@@ -21,7 +23,7 @@ from scipy.ndimage import generic_filter, label, binary_dilation
 from functools import lru_cache
 import ee
 import tkinter as tk
-from tkinter.filedialog import askopenfilename
+from tkinter import filedialog, messagebox
 import rasterio
 import webview
 import requests
@@ -31,6 +33,7 @@ import geopandas as gpd
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio import CRS
 import os
+import argparse
 import shutil
 import pandas as pd
 import rasterio.plot
@@ -56,20 +59,6 @@ import traceback
 from pyproj import Transformer
 import webbrowser
 
-
-# Garante visibilidade das DLLs (gdal/proj/geos) no Windows
-if sys.platform.startswith("win"):
-    env = sys.prefix  # caminho do env conda ativo
-    lib_bin = os.path.join(env, "Library", "bin")
-    gdal_data = os.path.join(env, "Library", "share", "gdal")
-    proj_lib = os.path.join(env, "Library", "share", "proj")
-    os.environ["PATH"] = lib_bin + os.pathsep + os.environ.get("PATH", "")
-    try:
-        os.add_dll_directory(lib_bin)
-    except Exception:
-        pass
-    os.environ["GDAL_DATA"] = gdal_data
-    os.environ["PROJ_LIB"] = proj_lib
 
 # Inicializa tema do customtkinter
 ctk.set_appearance_mode("System")
@@ -98,8 +87,8 @@ compass = "Icons/compass.png"
 map_ico = "Icons/map.png"
 susc = "Icons/susc.png"
 pin = "Icons/pin.png"
-pasta = "Icons/pasta.png"
-pixel = "Icons/pixel.png"
+pasta = "Icons/dir.png"
+pixel = "Icons/pixel_size.png"
 best = "Icons/best.png"
 update = "Icons/update.png"
 info = "Icons/info.png"
@@ -723,40 +712,238 @@ def del_file(file):
         os.remove(file)
 
 
-def initialize_ee():
-    access_granted = False
-    while not access_granted:
+def suppress_tcl_errors(exc, val, tb):
+    print("[Tkinter] Erro capturado:", val)
+
+EMAIL_REGEX = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+
+
+def _center_window(win, w=520, h=320):
+    win.update_idletasks()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = int((sw - w) / 2)
+    y = int((sh - h) / 2)
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+
+def _make_rounded_card(root, radius=20, pad=10, transparent='#010101', bg='#ffffff'):
+    supports_transparency = sys.platform.startswith('win')
+    if supports_transparency:
+        root.overrideredirect(True)
+        root.config(bg=transparent)
         try:
-            with open('Database/ee_credentials_path.txt', 'r') as file:
-                lines = file.readlines()
-            service_account = lines[0].strip()
-            cred_path = lines[1].strip()
-            print("\n🔐 Service Account:", service_account)
-            print("📁 Credential Path:", cred_path)
-            credentials = ee.ServiceAccountCredentials(service_account, cred_path)
-            ee.Initialize(credentials)
-            access_granted = True
+            root.wm_attributes('-transparentcolor', transparent)
+        except tk.TclError:
+            supports_transparency = False
+            root.overrideredirect(False)
+            root.config(bg=bg)
+    canvas = tk.Canvas(root,
+                       highlightthickness=0,
+                       bd=0,
+                       bg=(transparent if supports_transparency else bg))
+    canvas.pack(fill="both", expand=True)
+
+
+    def draw():
+        canvas.delete("all")
+        w = root.winfo_width()
+        h = root.winfo_height()
+        x0, y0 = pad, pad
+        x1, y1 = w - pad, h - pad
+        r = radius
+        canvas.create_arc(x0, y0, x0+2*r, y0+2*r, start=90, extent=90, fill=bg, outline=bg)
+        canvas.create_arc(x1-2*r, y0, x1, y0+2*r, start=0, extent=90, fill=bg, outline=bg)
+        canvas.create_arc(x1-2*r, y1-2*r, x1, y1, start=270, extent=90, fill=bg, outline=bg)
+        canvas.create_arc(x0, y1-2*r, x0+2*r, y1, start=180, extent=90, fill=bg, outline=bg)
+        canvas.create_rectangle(x0+r, y0, x1-r, y1, fill=bg, outline=bg)
+        canvas.create_rectangle(x0, y0+r, x1, y1-r, fill=bg, outline=bg)
+    root.bind("<Configure>", lambda e: draw())
+    draw()
+    inner = tk.Frame(canvas, bg=bg)
+    inner.place(relx=0.5, rely=0.5, anchor="center", relwidth=1.0, relheight=1.0)
+    inner.pack_propagate(False)
+    return canvas, inner
+
+
+def prompt_ee_credentials_gui():
+    root = tk.Tk()
+    root.report_callback_exception = suppress_tcl_errors
+    _center_window(root, 560, 360)
+    TITLE = "Connect to Google Earth Engine"
+    BG = "#ffffff"
+    ACCENT = "#111827"  # quase preto
+    SUB = "#6b7280"     # cinza
+    BTN_BG = "#111827"
+    BTN_FG = "#ffffff"
+    DISABLED_BG = "#9ca3af"
+    TRANSPARENT = "#010101"
+    canvas, card = _make_rounded_card(root, radius=24, pad=8, transparent=TRANSPARENT, bg=BG)
+    def start_move(e):
+        root._dragx, root._dragy = e.x_root, e.y_root
+    def on_move(e):
+        dx = e.x_root - root._dragx
+        dy = e.y_root - root._dragy
+        x = root.winfo_x() + dx
+        y = root.winfo_y() + dy
+        root.geometry(f"+{x}+{y}")
+        root._dragx, root._dragy = e.x_root, e.y_root
+    card.bind("<Button-1>", start_move)
+    card.bind("<B1-Motion>", on_move)
+    header = tk.Frame(card, bg=BG)
+    header.pack(fill="x", pady=(18, 8), padx=22)
+    title = tk.Label(header, text=TITLE, bg=BG, fg=ACCENT,
+                     font=("Segoe UI", 14, "bold"))
+    title.pack(side="left")
+    def _close():
+        root.destroy()
+        raise RuntimeError("Canceled by the user.")
+    close_btn = tk.Label(header, text="✕", bg=BG, fg=SUB, cursor="hand2",
+                         font=("Segoe UI", 12, "bold"))
+    close_btn.pack(side="right")
+    close_btn.bind("<Button-1>", lambda e: _close())
+    body = tk.Frame(card, bg=BG)
+    body.pack(fill="both", expand=True, pady=(0, 10), padx=22)
+    email_lbl = tk.Label(body, text="E-mail do Service Account", bg=BG, fg=ACCENT,
+                         font=("Segoe UI", 10, "bold"))
+    email_lbl.pack(anchor="w", pady=(4, 4))
+    email_var = tk.StringVar()
+    email_entry = tk.Entry(body, textvariable=email_var, bg="#f9fafb",
+                           bd=0, highlightthickness=1, relief="flat",
+                           highlightbackground="#e5e7eb", highlightcolor="#2563eb",
+                           font=("Segoe UI", 10))
+    email_entry.configure(insertbackground="#111827")
+    email_entry.pack(fill="x", ipady=8)
+    email_entry.focus_set()
+    email_hint = tk.Label(body, text="Use email as it is on your Service Account",
+                          bg=BG, fg=SUB, font=("Segoe UI", 9))
+    email_hint.pack(anchor="w", pady=(6, 14))
+
+    email_err = tk.Label(body, text="", bg=BG, fg="#dc2626", font=("Segoe UI", 9))
+    email_err.pack(anchor="w")
+
+    # JSON chooser
+    json_lbl = tk.Label(body, text="Credentials (.json file)", bg=BG, fg=ACCENT,
+                        font=("Segoe UI", 10, "bold"))
+    json_lbl.pack(anchor="w", pady=(14, 4))
+
+    file_frame = tk.Frame(body, bg=BG)
+    file_frame.pack(fill="x")
+
+    json_path_var = tk.StringVar(value="")
+    json_entry = tk.Entry(file_frame, textvariable=json_path_var, bg="#f9fafb",
+                          bd=0, highlightthickness=1, relief="flat",
+                          highlightbackground="#e5e7eb", highlightcolor="#2563eb",
+                          font=("Segoe UI", 10))
+    json_entry.configure(insertbackground="#111827")
+    json_entry.pack(side="left", fill="x", expand=True, ipady=8)
+
+    def browse_json():
+        path = filedialog.askopenfilename(
+            title="Select the Earth Engine JSON file",
+            filetypes=[("JSON files", "*.json")]
+        )
+        if path:
+            json_path_var.set(path)
+            validate_form()
+    browse_btn = tk.Button(file_frame, text="Procurar…", command=browse_json,
+                           bg="#f3f4f6", fg=ACCENT, relief="flat",
+                           activebackground="#e5e7eb", activeforeground=ACCENT,
+                           padx=10, pady=6)
+    browse_btn.pack(side="left", padx=(8, 0))
+    json_err = tk.Label(body, text="", bg=BG, fg="#dc2626", font=("Segoe UI", 9))
+    json_err.pack(anchor="w", pady=(4, 0))
+    footer = tk.Frame(card, bg=BG)
+    footer.pack(fill="x", pady=(8, 18), padx=22)
+    status_lbl = tk.Label(footer, text="", bg=BG, fg=SUB, font=("Segoe UI", 9))
+    status_lbl.pack(side="left")
+
+    def set_btn_state(enabled):
+        if enabled:
+            save_btn.config(state="normal", bg=BTN_BG, fg=BTN_FG, cursor="hand2")
+        else:
+            save_btn.config(state="disabled", bg=DISABLED_BG, fg="#f3f4f6", cursor="arrow")
+    save_btn = tk.Button(footer, text="Save and connect",
+                         bg=DISABLED_BG, fg="#f3f4f6",
+                         relief="flat", padx=14, pady=8, state="disabled",
+                         activebackground=BTN_BG, activeforeground=BTN_FG)
+    save_btn.pack(side="right")
+
+    # Validação
+    def is_valid_email(s: str) -> bool:
+        return bool(EMAIL_REGEX.match(s.strip()))
+
+    def validate_form(*_):
+        ok_email = is_valid_email(email_var.get())
+        ok_json  = os.path.isfile(json_path_var.get())
+        email_err.config(text="" if ok_email or not email_var.get().strip() else "Invalid email.")
+        json_err.config(text="" if ok_json or not json_path_var.get().strip() else "Select a valid .json file.")
+        set_btn_state(ok_email and ok_json)
+    email_var.trace_add("write", validate_form)
+    json_path_var.trace_add("write", validate_form)
+    result = {"email": None, "json": None}
+
+    def do_save():
+        # Tenta inicializar para garantir que as credenciais funcionam
+        sa = email_var.get().strip()
+        jp = json_path_var.get().strip()
+        try:
+            status_lbl.config(text="Connecting to Earth Engine…")
+            root.update_idletasks()
+            creds = ee.ServiceAccountCredentials(sa, jp)
+            ee.Initialize(creds)
+            # Ok — salva e fecha
+            result["email"] = sa
+            result["json"]  = jp
+            messagebox.showinfo("Success", "Earth Engine access granted ✔️")
+            root.quit()
         except Exception as e:
-            access_granted = False
-            print("\nFalha na inicialização do Earth Engine:", e)
-            print("\nInforme o e-mail vinculado ao Earth Engine API:")
-            a = input()
-            print("\nSelecione o arquivo JSON com as credenciais do Earth Engine API")
-            root = tk.Tk()
-            root.report_callback_exception = suppress_tcl_errors
-            root.withdraw()
-            b = askopenfilename(title="Selecione o arquivo JSON com as credenciais do Earth Engine API")
-            root.destroy()
-            root.mainloop()
-            with open('Database/ee_credentials_path.txt', 'w') as file:
-                file.write(f"{a}\n")
-                file.write(f"{b}")
-            print("\nCredenciais registradas com sucesso")
+            messagebox.showerror("Connection failed",
+                                 f"Unable to initialize with the provided credentials.\n\nDetails:\n{e}")
+        finally:
+            status_lbl.config(text="")
+    save_btn.config(command=do_save)
+    root.mainloop()
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    if not (result["email"] and result["json"]):
+        raise RuntimeError("Operation canceled by user.")
+    return result["email"], result["json"]
+
+
+def initialize_ee():
+    os.makedirs("Database", exist_ok=True)
+    cred_file = os.path.join("Database", "ee_credentials_path.txt")
+    def try_init_from_file(path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+        if len(lines) < 2:
+            raise ValueError("Arquivo de credenciais incompleto.")
+        service_account, cred_path = lines[0], lines[1]
+        creds = ee.ServiceAccountCredentials(service_account, cred_path)
+        ee.Initialize(creds)
+        return service_account, cred_path
+    try:
+        sa, jp = try_init_from_file(cred_file)
+        print(f"\n🔐 Service Account: {sa}\n📁 Credential Path: {jp}")
+        return sa, jp
+    except Exception as e:
+        print("\n[EE] Tentativa inicial falhou — abrindo assistente gráfico…")
+        print("Motivo:", e)
+    sa, jp = prompt_ee_credentials_gui()
+    try:
+        with open(cred_file, "w", encoding="utf-8") as f:
+            f.write(f"{sa}\n{jp}\n")
+        print("\nCredenciais registradas com sucesso.")
+        return sa, jp
+    except Exception as e:
+        raise RuntimeError(f"Não foi possível salvar o caminho das credenciais: {e}")
 
 
 def suppress_tcl_errors(*args):
     pass
-
 
 class Api:
     def send_coordinates(self, coordinates):
@@ -2238,6 +2425,14 @@ def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng):
 
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="PRIORI — Protocol for Road Infrastructure Operational Risk due to Inundation")
+    parser.add_argument("--version", action="store_true", help="Show PRIORI version and exit")
+    args = parser.parse_args()
+    if args.version:
+        print(__version__)
+        raise SystemExit(0)
+
     # Nomenclatura e descrição dos arquivos
     path_dem = "Resultados/dem_reproj.tif"                  # DEM reprojetada
     path_filled = "Resultados/dem_filled.tif"               # Preenchimento de depressões do DEM
@@ -2260,7 +2455,7 @@ if __name__ == "__main__":
     path_susimg = "Resultados/susceptibility.png"           # Imagem da suscetibilidade da região
     path_geopoi = "Resultados/pois.geojson"                 # Geojson com localização da infraestrutura funcional
     path_xlsxpoi = "Resultados/pois_info.xlsx"              # ID, nome, tipo, peso
-    path_census = "Database/Censo_2010.gpkg"                # Base de dados IBGE 2010
+    path_census = "Database/BR_Census.gpkg"  # Base de dados IBGE 2010
     path_sectors = "Resultados/sectors.gpkg"                # Setores e metadados completos
     path_xlsxsec = "Resultados/sectors_info.xlsx"           # Identificação, variáveis IBGE e parâmetros calculados
     path_zeta = "Resultados/zeta_tmp.tif"                   # Cálculo da variável Zeta para as rodovias
