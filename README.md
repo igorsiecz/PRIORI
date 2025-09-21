@@ -1,8 +1,35 @@
 # PRIORI - Protocol for Road Infrastructure Operational Risk due to Inundation
 
 [![Version](https://img.shields.io/github/v/tag/igorsiecz/PRIORI?label=version&sort=semver&cacheSeconds=120)](https://github.com/igorsiecz/PRIORI/releases)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17168269.svg)](https://doi.org/10.5281/zenodo.17168269)
 
 *A GIS-based framework to quantify flood-related **operational risk** in road networks — integrating geomorphological susceptibility, multi‑criteria road vulnerability, and risk mapping.*
+
+*A GIS-based framework to quantify flood-related **operational risk** in road networks — integrating geomorphological susceptibility, multi-criteria road vulnerability, and risk mapping.*
+
+> **How to cite**
+>
+> Moreira, I. S. (2025). **PRIORI - Protocol for Road Infrastructure Operational Risk due to Inundation**. Zenodo. https://doi.org/10.5281/zenodo.17168269
+>
+> **BibTeX**
+> ```bibtex
+> @software{moreira_2025_17168270,
+>   author       = {Moreira, Igor Sieczkowski},
+>   title        = {PRIORI - Protocol for Road Infrastructure Operational Risk due to Inundation},
+>   month        = sep,
+>   year         = 2025,
+>   publisher    = {Zenodo},
+>   version      = {v1.0.1},
+>   doi          = {10.5281/zenodo.17168269},
+>   url          = {https://doi.org/10.5281/zenodo.17168269},
+>   swhid        = {swh:1:dir:10952e8fd75132083e75bc2d1a6caa1d1a77c0a9
+>                    ;origin=https://doi.org/10.5281/zenodo.17168269;vi
+>                    sit=swh:1:snp:89a45cd4a822656ca0b17681058bc6b18814
+>                    cb2e;anchor=swh:1:rel:64a3cf8bc1715f7ba60a8c8d32b8
+>                    295e79766764;path=igorsiecz-PRIORI-f205ed6
+>                   },
+> }
+> ```
 
 > **Project origin & funding**
 >

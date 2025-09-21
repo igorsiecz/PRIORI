@@ -1,5 +1,14 @@
-# CHANGELOG
-All notable changes to this project will be documented here.
+## [1.0.2] - 2025-09-20
+### Changed
+- README: add concept DOI badge and “How to cite” block.
+- CITATION.cff: include concept DOI (DataCite/Zenodo).
+- Minor wording and structure improvements in documentation.
+
+## [1.0.1] - 2025-09-20
+### Changed
+- Bump project version to **1.0.1**.
+- Fix `CITATION.cff` and improve metadata for Zenodo.
+- README improvements (badges, installation/EE/SAGA notes), Windows DLL guidance.
 
 ## [1.0.0] - 2025-09-20
 ### Added
