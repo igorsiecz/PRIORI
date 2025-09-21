@@ -2,7 +2,7 @@
 # Copyright (c) 2025 Igor Sieczkowski Moreira
 
 # PRIORI.py
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 import re
 import sys

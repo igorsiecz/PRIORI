@@ -1,3 +1,7 @@
+## [1.0.3] - 2025-09-20
+### Changed
+- Name adjust in citation file.
+
 ## [1.0.2] - 2025-09-20
 ### Changed
 - README: add concept DOI badge and “How to cite” block.
@@ -7,6 +11,7 @@
 ## [1.0.1] - 2025-09-20
 ### Changed
 - Bump project version to **1.0.1**.
+- First DOI release.
 - Fix `CITATION.cff` and improve metadata for Zenodo.
 - README improvements (badges, installation/EE/SAGA notes), Windows DLL guidance.
 
