@@ -24,6 +24,11 @@ dependencies:
   - qtpy
   - pyqt
   - fiona
+  - scikit-learn
+  - psutil
+  - rtree
+  - pyqtwebengine
+  - joblib
   - pip
   - pip:
       - whitebox

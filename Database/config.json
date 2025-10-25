@@ -1,0 +1,107 @@
+{
+  "BUFFER_M": 100.0,
+  "MRVBF_HIGH_LEVEL": 6.0,
+  "universal_TR_ladder": [
+    5.0,
+    10.0,
+    25.0,
+    50.0,
+    100.0,
+    "inf"
+  ],
+  "HGBR": {
+    "iters": 2000,
+    "learning_rate": 0.07,
+    "max_depth": null,
+    "early_stopping": true,
+    "n_iter_no_change": 50,
+    "validation_fraction": 0.1,
+    "max_leaf_nodes": 63,
+    "min_samples_leaf": 200,
+    "l2_regularization": 0.001,
+    "threads_used": 6
+  },
+  "RF": {
+    "n_estimators": 1200,
+    "min_samples_leaf": 20,
+    "max_features": 0.5,
+    "oob_score_requested": false,
+    "oob_score_used": false,
+    "n_jobs": 1
+  },
+  "river_A": {
+    "river_id": 0,
+    "river_type": "plano",
+    "tr_ladder": [
+      5.0,
+      10.0,
+      25.0,
+      50.0,
+      100.0,
+      Infinity
+    ],
+    "ctx_planarity": 0.0947753755399206,
+    "ctx_mrvbf_p90": 5.984095096588135,
+    "pixel_size_m": 30.038505265437905,
+    "crs": "EPSG:32722",
+    "shape": [
+      1052,
+      1014
+    ],
+    "features": [
+      "HAND",
+      "MRVBF",
+      "in_channel",
+      "dist_to_channel_m",
+      "log_dist_m",
+      "in_buffer",
+      "plain_frac100",
+      "ctx_planarity",
+      "ctx_mrvbf_p90",
+      "HAND_scaled_1",
+      "HAND_scaled_2",
+      "HANDxMRVBF",
+      "HAND_eff",
+      "HAND_z",
+      "HAND_rank"
+    ],
+    "valid_count": 954662
+  },
+  "river_B": {
+    "river_id": 1,
+    "river_type": "encaixado",
+    "tr_ladder": [
+      10.0,
+      25.0,
+      50.0,
+      100.0,
+      Infinity
+    ],
+    "ctx_planarity": 0.19883179789153765,
+    "ctx_mrvbf_p90": 6.412572860717773,
+    "pixel_size_m": 30.017714427546224,
+    "crs": "EPSG:32722",
+    "shape": [
+      226,
+      745
+    ],
+    "features": [
+      "HAND",
+      "MRVBF",
+      "in_channel",
+      "dist_to_channel_m",
+      "log_dist_m",
+      "in_buffer",
+      "plain_frac100",
+      "ctx_planarity",
+      "ctx_mrvbf_p90",
+      "HAND_scaled_1",
+      "HAND_scaled_2",
+      "HANDxMRVBF",
+      "HAND_eff",
+      "HAND_z",
+      "HAND_rank"
+    ],
+    "valid_count": 108095
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "feature_names": [
+    "HAND",
+    "MRVBF",
+    "in_channel",
+    "dist_to_channel_m",
+    "log_dist_m",
+    "in_buffer",
+    "plain_frac100",
+    "ctx_planarity",
+    "ctx_mrvbf_p90",
+    "HAND_scaled_1",
+    "HAND_scaled_2",
+    "HANDxMRVBF",
+    "HAND_eff",
+    "HAND_z",
+    "HAND_rank"
+  ],
+  "monotonic_cst": [
+    1,
+    0,
+    -1,
+    1,
+    1,
+    -1,
+    -1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "note": "Aplique nesta ordem ao inferir em novos rios. Forçar classe K no leito (in_channel==1) é recomendado."
+}

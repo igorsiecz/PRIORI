@@ -2,14 +2,13 @@
 # Copyright (c) 2025 Igor Sieczkowski Moreira
 
 # PRIORI.py
-__version__ = "1.0.3"
+__version__ = "2.0.0"
 
 import re
 import sys
 import threading
 import time
 from datetime import datetime
-from scipy.ndimage import distance_transform_edt
 from whitebox.whitebox_tools import WhiteboxTools
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -18,28 +17,28 @@ from cartopy import crs as ccrs
 from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
 import rasterio.plot
 from matplotlib.patches import Patch
-from skimage.morphology import opening, closing, disk
-from scipy.ndimage import generic_filter, label, binary_dilation
 from functools import lru_cache
 import ee
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import rasterio
-import webview
 import requests
 import osmnx as ox
 from osgeo import ogr, gdal
 import geopandas as gpd
-from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.warp import calculate_default_transform, reproject, Resampling, transform_bounds
 from rasterio import CRS
+from rasterio.windows import Window
+from scipy.ndimage import distance_transform_edt, uniform_filter
 import os
+import json
 import argparse
 import shutil
 import pandas as pd
 import rasterio.plot
 import numpy as np
 from shapely.geometry import Polygon
-from rasterio.features import rasterize
+from rasterio.features import rasterize, shapes
 from shapely.ops import unary_union
 from shapely.geometry import mapping
 import customtkinter as ctk
@@ -58,6 +57,54 @@ import matplotlib
 import traceback
 from pyproj import Transformer
 import webbrowser
+import warnings
+import logging
+import math
+from pathlib import Path
+from hashlib import sha256
+
+
+# Silencia avisos indesejados
+os.environ.setdefault("PYWEBVIEW_GUI", "edgechromium")
+os.environ.setdefault("WEBVIEW_GUI", "edgechromium")
+os.environ.setdefault("PYWEBVIEW_LOG", "error")
+logging.getLogger("pywebview").setLevel(logging.ERROR)
+logging.getLogger("webview").setLevel(logging.ERROR)
+logging.getLogger("qtpy").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=UserWarning)
+import webview
+_orig_stderr = sys.stderr
+_orig_stdout = sys.stdout
+
+class _StreamFilter(io.TextIOBase):
+    _ignore_tokens = (
+        # Tcl/Tk "after" noise
+        "invalid command name", '("after" script)', "check_dpi_scaling", "_click_animation",
+        # pywebview/Qt noise
+        "[pywebview] QT cannot be loaded", "qtpy", "QtWebEngineCore", "QtModuleNotInstalledError",
+        "QtWebKitWidgets", "webview.platforms.qt")
+    def __init__(self, real):
+        self._real = real
+    def write(self, s):
+        try:
+            if any(tok in s for tok in self._ignore_tokens):
+                return len(s)
+        except Exception:
+            pass
+        return self._real.write(s)
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+sys.stderr = _StreamFilter(_orig_stderr)
+sys.stdout = _StreamFilter(_orig_stdout)
+
+def silence_tcl_bgerrors(root):
+    try:
+        root.tk.eval('proc bgerror {msg} {}')
+    except Exception:
+        pass
 
 
 # Inicializa tema do customtkinter
@@ -71,6 +118,23 @@ captured_coordinates = None
 time_start = None
 logs_salvos = []
 matplotlib.use('Agg')
+RUN_MODE = "full"
+DEFAULT_MODELS = [
+    {
+        "path": "Database/model_rf.joblib",
+        "sha256": "C1E02E41FE6B6CA0E8C65C4FDF235F41A93454DAB1F8C5DB6B447DCE4F20FF7B",
+        "urls": [
+            "https://github.com/igorsiecz/PRIORI/releases/download/v2.0.0/model_rf.joblib",
+        ],
+    },
+    {
+        "path": "Database/model_hgbr.joblib",
+        "sha256": "4C767E0F862EC243AD9B72AC56D98EC130F2F062849C9F0ADD24EEC7B6BE9B89",
+        "urls": [
+            "https://github.com/igorsiecz/PRIORI/releases/download/v2.0.0/model_hgbr.joblib",
+        ],
+    },
+]
 
 # Palheta de cores
 azul_escuro = "#003566"
@@ -97,6 +161,101 @@ alerta = "Icons/alert.png"
 error = "Icons/error.png"
 logo = "Icons/logo_horizontal.png"
 logo_ico = "Icons/logo_ico.ico"
+
+
+def _sha256(path: str) -> str:
+    h = sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _download_with_progress(url: str, dest: str, chunk=1024 * 1024, timeout=120) -> bool:
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    spinner = log_loading(loading, f"Downloading {os.path.basename(dest)} …")
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length", "0") or 0)
+            read = 0
+            with open(tmp, "wb") as f:
+                for blk in r.iter_content(chunk_size=chunk):
+                    if not blk:
+                        continue
+                    f.write(blk)
+                    read += len(blk)
+                    if total:
+                        pct = int(read * 100 / total)
+                        print(f"\r{os.path.basename(dest)} {pct}%", end="")
+        os.replace(tmp, dest)
+        return True
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except:
+            pass
+        print(f"[download] {url} → error: {e}")
+        return False
+    finally:
+        try:
+            spinner()
+        except:
+            pass
+
+def _resolve_manifest():
+    cfg_path = os.path.join("Database", "config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        models = cfg.get("models") or cfg.get("model_urls")
+        if isinstance(models, list) and models:
+            return models
+    except Exception:
+        pass
+    return DEFAULT_MODELS
+
+def ensure_models():
+    models = _resolve_manifest()
+    missing = []
+    for m in models:
+        path = m["path"]
+        expected = (m.get("sha256") or "").lower()
+        if os.path.exists(path) and expected:
+            try:
+                if _sha256(path).lower() == expected:
+                    log(check, f"OK: {path} (verified)")
+                    continue
+                else:
+                    print(f"[integrity] {path} checksum mismatch. Redownloading.")
+                    os.remove(path)
+            except Exception:
+                pass
+        if os.path.exists(path) and not expected:
+            log(check, f"OK: {path}")
+            continue
+        missing.append(m)
+    for m in missing:
+        path = m["path"]; urls = m.get("urls") or []; ok = False
+        for url in urls:
+            log(info, f"Fetching model from:\n{url}")
+            if _download_with_progress(url, path):
+                if m.get("sha256"):
+                    got = _sha256(path).lower()
+                    if got != m["sha256"].lower():
+                        print(f"[integrity] SHA256 mismatch for {path}; deleting.")
+                        try: os.remove(path)
+                        except: pass
+                        continue
+                log(pasta, f"File: {path} — downloaded")
+                ok = True
+                break
+        if not ok:
+            raise RuntimeError(
+                f"Could not obtain required model: {path}\n"
+                f"Tried URLs: {urls}\n"
+                "Publish the Release assets (or provide a Zenodo URL) and run again.")
 
 
 spinner_registry: dict[int, callable] = {}
@@ -321,6 +480,7 @@ def iniciar_fluxo(root):
 def initialize_tela_inicial():
     ctk.set_appearance_mode("light")
     root = ctk.CTk(fg_color=Theme.BG)
+    silence_tcl_bgerrors(root)
     root.title(APP_NAME)
     center_window(root, APP_WIDTH, APP_HEIGHT)
     root.resizable(False, False)
@@ -339,6 +499,72 @@ def initialize_tela_inicial():
     footer.place(relx=0.5, rely=0.985, anchor="s")
     root.protocol("WM_DELETE_WINDOW", lambda: on_close(root))
     root.mainloop()
+
+
+
+
+def prompt_module_choice():
+    BG = "#ffffff"
+    ACCENT = "#111827"
+    SUB = "#6b7280"
+    TRANSPARENT = "#010101"
+    root = tk.Tk()
+    silence_tcl_bgerrors(root)
+    root.report_callback_exception = suppress_tcl_errors
+    _center_window(root, 560, 320)
+    canvas, card = _make_rounded_card(root, radius=24, pad=8, transparent=TRANSPARENT, bg=BG)
+
+    def start_move(e):
+        root._dragx, root._dragy = e.x_root, e.y_root
+
+    def on_move(e):
+        dx, dy = e.x_root - root._dragx, e.y_root - root._dragy
+        root.geometry(f"+{root.winfo_x()+dx}+{root.winfo_y()+dy}")
+        root._dragx, root._dragy = e.x_root, e.y_root
+
+    card.bind("<Button-1>", start_move)
+    card.bind("<B1-Motion>", on_move)
+    header = tk.Frame(card, bg=BG)
+    header.pack(fill="x", pady=(18, 8), padx=22)
+    tk.Label(header, text="Select modules to run", bg=BG, fg=ACCENT, font=("Segoe UI", 14, "bold")).pack(side="left")
+
+    def _cancel():
+        root.destroy()
+        raise RuntimeError("Canceled by the user.")
+
+    tk.Label(header, text="✕", bg=BG, fg=SUB, cursor="hand2", font=("Segoe UI", 12, "bold")).pack(side="right")
+    header.winfo_children()[-1].bind("<Button-1>", lambda e: _cancel())
+    body = tk.Frame(card, bg=BG)
+    body.pack(fill="both", expand=True, padx=22, pady=(2, 10))
+    choice = tk.StringVar(value="full")
+    full_frame = tk.Frame(body, bg=BG)
+    full_frame.pack(fill="x", pady=(6, 0))
+    tk.Radiobutton(
+        full_frame, text="Full Risk (Susceptibility + Vulnerability)", variable=choice, value="full",
+        bg=BG, fg=ACCENT, activebackground=BG, activeforeground=ACCENT, selectcolor=BG,
+        font=("Segoe UI", 11, "bold")
+    ).pack(anchor="w")
+    tk.Label(
+        full_frame, text="Note: Vulnerability module is currently limited to Brazil.",
+        bg=BG, fg=SUB, font=("Segoe UI", 9)
+    ).pack(anchor="w", padx=(26, 0), pady=(2, 0))
+    susc_frame = tk.Frame(body, bg=BG)
+    susc_frame.pack(fill="x", pady=(16, 0))
+    tk.Radiobutton(
+        susc_frame, text="Susceptibility only", variable=choice, value="susc_only",
+        bg=BG, fg=ACCENT, activebackground=BG, activeforeground=ACCENT, selectcolor=BG,
+        font=("Segoe UI", 11, "bold")
+    ).pack(anchor="w")
+    footer = tk.Frame(card, bg=BG)
+    footer.pack(fill="x", pady=(8, 18), padx=22)
+    btn = tk.Button(footer, text="Run", bg=ACCENT, fg="#ffffff", relief="flat", padx=14, pady=8,
+                    activebackground=ACCENT, activeforeground="#ffffff", cursor="hand2",
+                    command=root.quit)
+    btn.pack(side="right")
+    root.mainloop()
+    try: root.destroy()
+    except: pass
+    return choice.get()
 
 
 def iniciar_fluxo(root_tela_inicial):
@@ -360,6 +586,7 @@ def mostrar_tela_logs(north_east_lat, north_east_lng, south_west_lat, south_west
     FONT_BUTTON = ("Sans Serif", 14, "bold")
     global root_logs, log_container
     root_logs = ctk.CTk(fg_color=BG_COLOR)
+    root_logs.report_callback_exception = suppress_tcl_errors
     root_logs.title("PRIORI Execution Log")
     root_logs.iconbitmap(logo_ico)
     w, h = 1180, 720
@@ -414,6 +641,15 @@ def mostrar_tela_logs(north_east_lat, north_east_lng, south_west_lat, south_west
         command=exportar_logs_completos)
     btn_export.grid(row=0, column=0, padx=20)
     def on_close():
+        try:
+            for stopper in list(spinner_registry.values()):
+                try:
+                    stopper()
+                except:
+                    pass
+            spinner_registry.clear()
+        except Exception:
+            pass
         del_pasta("cache")
         del_file("dem_tmp.tif")
         del_file("Flow_accumulation_withnodata.tif")
@@ -438,7 +674,7 @@ def mostrar_tela_logs(north_east_lat, north_east_lng, south_west_lat, south_west
         time.sleep(0.1)
         threading.Thread(
             target=run_priori,
-            args=(north_east_lat, north_east_lng, south_west_lat, south_west_lng),
+            args=(north_east_lat, north_east_lng, south_west_lat, south_west_lng, RUN_MODE),
             daemon=True).start()
     root_logs.after(200, start_priori_thread)
     root_logs.mainloop()
@@ -604,6 +840,7 @@ def log_loading(icon_path, message, font_size=12, font_weight="normal", icon_siz
         font=ctk.CTkFont(size=font_size, weight=font_weight),
         text_color=color)
     label_msg.pack(side="left")
+
     def rotate():
         if not running[0]:
             frame_container.destroy()
@@ -714,7 +951,6 @@ def del_file(file):
 
 def suppress_tcl_errors(exc, val, tb):
     print("[Tkinter] Erro capturado:", val)
-
 EMAIL_REGEX = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
 
 
@@ -738,10 +974,7 @@ def _make_rounded_card(root, radius=20, pad=10, transparent='#010101', bg='#ffff
             supports_transparency = False
             root.overrideredirect(False)
             root.config(bg=bg)
-    canvas = tk.Canvas(root,
-                       highlightthickness=0,
-                       bd=0,
-                       bg=(transparent if supports_transparency else bg))
+    canvas = tk.Canvas(root, highlightthickness=0, bd=0, bg=(transparent if supports_transparency else bg))
     canvas.pack(fill="both", expand=True)
 
 
@@ -768,19 +1001,22 @@ def _make_rounded_card(root, radius=20, pad=10, transparent='#010101', bg='#ffff
 
 def prompt_ee_credentials_gui():
     root = tk.Tk()
+    silence_tcl_bgerrors(root)
     root.report_callback_exception = suppress_tcl_errors
     _center_window(root, 560, 360)
     TITLE = "Connect to Google Earth Engine"
     BG = "#ffffff"
-    ACCENT = "#111827"  # quase preto
-    SUB = "#6b7280"     # cinza
+    ACCENT = "#111827"
+    SUB = "#6b7280"
     BTN_BG = "#111827"
     BTN_FG = "#ffffff"
     DISABLED_BG = "#9ca3af"
     TRANSPARENT = "#010101"
     canvas, card = _make_rounded_card(root, radius=24, pad=8, transparent=TRANSPARENT, bg=BG)
+
     def start_move(e):
         root._dragx, root._dragy = e.x_root, e.y_root
+
     def on_move(e):
         dx = e.x_root - root._dragx
         dy = e.y_root - root._dragy
@@ -788,68 +1024,55 @@ def prompt_ee_credentials_gui():
         y = root.winfo_y() + dy
         root.geometry(f"+{x}+{y}")
         root._dragx, root._dragy = e.x_root, e.y_root
+
     card.bind("<Button-1>", start_move)
     card.bind("<B1-Motion>", on_move)
     header = tk.Frame(card, bg=BG)
     header.pack(fill="x", pady=(18, 8), padx=22)
-    title = tk.Label(header, text=TITLE, bg=BG, fg=ACCENT,
-                     font=("Segoe UI", 14, "bold"))
+    title = tk.Label(header, text=TITLE, bg=BG, fg=ACCENT, font=("Segoe UI", 14, "bold"))
     title.pack(side="left")
+
     def _close():
         root.destroy()
         raise RuntimeError("Canceled by the user.")
-    close_btn = tk.Label(header, text="✕", bg=BG, fg=SUB, cursor="hand2",
-                         font=("Segoe UI", 12, "bold"))
+
+    close_btn = tk.Label(header, text="✕", bg=BG, fg=SUB, cursor="hand2", font=("Segoe UI", 12, "bold"))
     close_btn.pack(side="right")
     close_btn.bind("<Button-1>", lambda e: _close())
     body = tk.Frame(card, bg=BG)
     body.pack(fill="both", expand=True, pady=(0, 10), padx=22)
-    email_lbl = tk.Label(body, text="E-mail do Service Account", bg=BG, fg=ACCENT,
-                         font=("Segoe UI", 10, "bold"))
+    email_lbl = tk.Label(body, text="E-mail do Service Account", bg=BG, fg=ACCENT, font=("Segoe UI", 10, "bold"))
     email_lbl.pack(anchor="w", pady=(4, 4))
     email_var = tk.StringVar()
-    email_entry = tk.Entry(body, textvariable=email_var, bg="#f9fafb",
-                           bd=0, highlightthickness=1, relief="flat",
-                           highlightbackground="#e5e7eb", highlightcolor="#2563eb",
-                           font=("Segoe UI", 10))
+    email_entry = tk.Entry(body, textvariable=email_var, bg="#f9fafb", bd=0, highlightthickness=1, relief="flat",
+                           highlightbackground="#e5e7eb", highlightcolor="#2563eb", font=("Segoe UI", 10))
     email_entry.configure(insertbackground="#111827")
     email_entry.pack(fill="x", ipady=8)
     email_entry.focus_set()
-    email_hint = tk.Label(body, text="Use email as it is on your Service Account",
-                          bg=BG, fg=SUB, font=("Segoe UI", 9))
+    email_hint = tk.Label(body, text="Use email as it is on your Service Account", bg=BG, fg=SUB, font=("Segoe UI", 9))
     email_hint.pack(anchor="w", pady=(6, 14))
-
     email_err = tk.Label(body, text="", bg=BG, fg="#dc2626", font=("Segoe UI", 9))
     email_err.pack(anchor="w")
-
-    # JSON chooser
-    json_lbl = tk.Label(body, text="Credentials (.json file)", bg=BG, fg=ACCENT,
-                        font=("Segoe UI", 10, "bold"))
+    json_lbl = tk.Label(body, text="Credentials (.json file)", bg=BG, fg=ACCENT, font=("Segoe UI", 10, "bold"))
     json_lbl.pack(anchor="w", pady=(14, 4))
-
     file_frame = tk.Frame(body, bg=BG)
     file_frame.pack(fill="x")
-
     json_path_var = tk.StringVar(value="")
-    json_entry = tk.Entry(file_frame, textvariable=json_path_var, bg="#f9fafb",
-                          bd=0, highlightthickness=1, relief="flat",
-                          highlightbackground="#e5e7eb", highlightcolor="#2563eb",
-                          font=("Segoe UI", 10))
+    json_entry = tk.Entry(file_frame, textvariable=json_path_var, bg="#f9fafb", bd=0, highlightthickness=1, relief="flat",
+                          highlightbackground="#e5e7eb", highlightcolor="#2563eb", font=("Segoe UI", 10))
     json_entry.configure(insertbackground="#111827")
     json_entry.pack(side="left", fill="x", expand=True, ipady=8)
 
     def browse_json():
         path = filedialog.askopenfilename(
             title="Select the Earth Engine JSON file",
-            filetypes=[("JSON files", "*.json")]
-        )
+            filetypes=[("JSON files", "*.json")])
         if path:
             json_path_var.set(path)
             validate_form()
-    browse_btn = tk.Button(file_frame, text="Procurar…", command=browse_json,
-                           bg="#f3f4f6", fg=ACCENT, relief="flat",
-                           activebackground="#e5e7eb", activeforeground=ACCENT,
-                           padx=10, pady=6)
+
+    browse_btn = tk.Button(file_frame, text="Procurar…", command=browse_json, bg="#f3f4f6", fg=ACCENT, relief="flat",
+                           activebackground="#e5e7eb", activeforeground=ACCENT, padx=10, pady=6)
     browse_btn.pack(side="left", padx=(8, 0))
     json_err = tk.Label(body, text="", bg=BG, fg="#dc2626", font=("Segoe UI", 9))
     json_err.pack(anchor="w", pady=(4, 0))
@@ -863,13 +1086,11 @@ def prompt_ee_credentials_gui():
             save_btn.config(state="normal", bg=BTN_BG, fg=BTN_FG, cursor="hand2")
         else:
             save_btn.config(state="disabled", bg=DISABLED_BG, fg="#f3f4f6", cursor="arrow")
-    save_btn = tk.Button(footer, text="Save and connect",
-                         bg=DISABLED_BG, fg="#f3f4f6",
-                         relief="flat", padx=14, pady=8, state="disabled",
-                         activebackground=BTN_BG, activeforeground=BTN_FG)
+
+    save_btn = tk.Button(footer, text="Save and connect", bg=DISABLED_BG, fg="#f3f4f6", relief="flat", padx=14, pady=8,
+                         state="disabled", activebackground=BTN_BG, activeforeground=BTN_FG)
     save_btn.pack(side="right")
 
-    # Validação
     def is_valid_email(s: str) -> bool:
         return bool(EMAIL_REGEX.match(s.strip()))
 
@@ -879,12 +1100,12 @@ def prompt_ee_credentials_gui():
         email_err.config(text="" if ok_email or not email_var.get().strip() else "Invalid email.")
         json_err.config(text="" if ok_json or not json_path_var.get().strip() else "Select a valid .json file.")
         set_btn_state(ok_email and ok_json)
+
     email_var.trace_add("write", validate_form)
     json_path_var.trace_add("write", validate_form)
     result = {"email": None, "json": None}
 
     def do_save():
-        # Tenta inicializar para garantir que as credenciais funcionam
         sa = email_var.get().strip()
         jp = json_path_var.get().strip()
         try:
@@ -945,6 +1166,7 @@ def initialize_ee():
 def suppress_tcl_errors(*args):
     pass
 
+
 class Api:
     def send_coordinates(self, coordinates):
         global captured_coordinates
@@ -968,32 +1190,100 @@ def coordinates():
         exit(-1)
 
 
-def get_copernicus_dem(coord_1, coord_2, coord_3, coord_4, output_dem):
+def get_copernicus_dem(coord_1, coord_2, coord_3, coord_4, output_dem, native_scale_m=30, max_side_px=10_000,
+                       max_request_bytes=50_331_648, bytes_per_pixel_est=4.5,safety_margin=0.90,
+                       retry_http_statuses=(500, 502, 503, 504), max_retries=5, backoff_shrink=0.85, request_timeout=180):
     log(pin, "Digital Elevation Model (DEM)", color="black", font_size=14, font_weight="bold", icon_size=14)
-    roi = ee.Geometry.BBox(coord_1, coord_2, coord_3, coord_4)
-    dem = ee.ImageCollection("COPERNICUS/DEM/GLO30")
-    if dem.size().getInfo() == 0:
-        print(f'Não foram encontradas imagens para as coordenadas especificadas')
-        exit(-1)
-    dem = dem.select(['DEM']).mosaic().clip(roi)
-    print("\n⚙️ Iniciando o download do DEM...")
-    spinner = log_loading(loading, "Downloading DEM file...")
-    download_url = dem.getDownloadURL({
-        'scale': 30,
-        'region': roi.getInfo()['coordinates'],
-        'format': 'GeoTIFF'
-    })
-    response = requests.get(download_url)
-    if response.status_code == 200:
-        filename = f'dem_tmp.tif'
-        with open(filename, 'wb') as f:
-            f.write(response.content)
-        spinner()
-        print(f'✅ Download realizado com sucesso')
-        reproject_dem(output_dem)
+    w, s, e, n = coord_1, coord_2, coord_3, coord_4
+    cx = (w + e) / 2.0
+    cy = (s + n) / 2.0
+    dem_ic = ee.ImageCollection("COPERNICUS/DEM/GLO30")
+    if dem_ic.size().getInfo() == 0:
+        raise RuntimeError("Não foram encontradas imagens para as coordenadas especificadas.")
+    m_per_lat = 110_574.0
+    m_per_lon = 111_320.0 * math.cos(math.radians(cy))
+    width_deg = max(e - w, 1e-12)
+    height_deg = max(n - s, 1e-12)
+    width_m = width_deg * m_per_lon
+    height_m = height_deg * m_per_lat
+    native_w_px = width_m / native_scale_m
+    native_h_px = height_m / native_scale_m
+    aspect = native_w_px / max(native_h_px, 1e-12)
+    max_pixels_by_bytes = int((max_request_bytes * safety_margin) // bytes_per_pixel_est)
+    w_by_bytes = int(math.floor(math.sqrt(max_pixels_by_bytes * aspect)))
+    h_by_bytes = int(math.floor(math.sqrt(max_pixels_by_bytes / aspect)))
+    if aspect >= 1.0:
+        w_by_dim = max_side_px
+        h_by_dim = max(1, int(math.floor(w_by_dim / aspect)))
     else:
-        print(f'Erro ao fazer o download: {response.status_code}')
-        exit(-1)
+        h_by_dim = max_side_px
+        w_by_dim = max(1, int(math.floor(h_by_dim * aspect)))
+    target_w_px = max(1, min(w_by_bytes, w_by_dim))
+    target_h_px = max(1, min(h_by_bytes, h_by_dim))
+    need_expand = (native_w_px < target_w_px) or (native_h_px < target_h_px)
+    if need_expand:
+        new_width_m = target_w_px * native_scale_m
+        new_height_m = target_h_px * native_scale_m
+        new_width_deg = new_width_m / m_per_lon
+        new_height_deg = new_height_m / m_per_lat
+        w2 = cx - new_width_deg / 2.0
+        e2 = cx + new_width_deg / 2.0
+        s2 = cy - new_height_deg / 2.0
+        n2 = cy + new_height_deg / 2.0
+    else:
+        w2, s2, e2, n2 = w, s, e, n
+    roi_final = ee.Geometry.BBox(w2, s2, e2, n2)
+    dem = dem_ic.select(['DEM']).mosaic().clip(roi_final)
+
+    def _try(dim_w, dim_h):
+        params = {
+            'region': roi_final.getInfo()['coordinates'],
+            'format': 'GeoTIFF', 'dimensions': f"{int(dim_w)}x{int(dim_h)}"}
+        print(f"\n⚙️ Iniciando o download do DEM... (dimensions={params['dimensions']})")
+        spinner = log_loading(loading, "Downloading DEM file...")
+        try:
+            url = dem.getDownloadURL(params)
+        except Exception as e:
+            msg = str(e)
+            m = re.search(r"Total request size \((\d+) bytes\) must be less than or equal to (\d+) bytes", msg)
+            spinner()
+            if m:
+                requested = int(m.group(1))
+                allowed = int(m.group(2))
+                print(f"⚠️ EE limit: requested={requested:,} bytes > allowed={allowed:,} bytes")
+                return None, (requested, allowed)
+            raise
+        resp = requests.get(url, timeout=request_timeout)
+        spinner()
+        if resp.status_code == 200:
+            with open('dem_tmp.tif', 'wb') as f:
+                f.write(resp.content)
+            print('✅ Download realizado com sucesso')
+            reproject_dem(output_dem)
+            return True, None
+        else:
+            print(f"⚠️ Erro HTTP ao baixar: {resp.status_code}")
+            return False, resp.status_code
+    cur_w, cur_h = target_w_px, target_h_px
+    for attempt in range(1, max_retries + 1):
+        ok, info = _try(cur_w, cur_h)
+        if ok is True:
+            # sucesso
+            return (w2, s2, e2, n2)
+        if ok is None and isinstance(info, tuple):
+            requested_bytes, allowed_bytes = info
+            shrink = math.sqrt(allowed_bytes / max(requested_bytes, 1)) * 0.90
+            cur_w = max(1, int(cur_w * shrink))
+            cur_h = max(1, int(cur_h * shrink))
+            print(f"↩️ Reajustando dimensions (bytes): fator={shrink:.3f} → {cur_w}x{cur_h} (tentativa {attempt+1}/{max_retries})")
+            continue
+        if ok is False and (info in retry_http_statuses or isinstance(info, int)):
+            cur_w = max(1, int(cur_w * backoff_shrink))
+            cur_h = max(1, int(cur_h * backoff_shrink))
+            print(f"↩️ Reajustando dimensions (HTTP {info}): fator={backoff_shrink:.2f} → {cur_w}x{cur_h} (tentativa {attempt+1}/{max_retries})")
+            continue
+        break
+    raise RuntimeError("Não foi possível baixar o DEM dentro dos limites/retries do getDownloadURL.")
 
 
 def reproject_dem(output_dem):
@@ -1021,6 +1311,50 @@ def reproject_dem(output_dem):
     log(pasta, f"File: {output_dem} — Reprojected")
 
 
+def clip_raster_to_bbox_wgs84(path_in: str, path_out: str, bbox_wgs84: tuple):
+    w, s, e, n = bbox_wgs84
+    if w > e: w, e = e, w
+    if s > n: s, n = n, s
+    with rasterio.open(path_in) as src:
+        src_crs = src.crs
+        if src_crs is None:
+            raise ValueError("Raster sem CRS; não é possível reprojetar a bbox.")
+        left, bottom, right, top = transform_bounds("EPSG:4326", src_crs, w, s, e, n, densify_pts=0)
+        rb = src.bounds
+        left = max(left,   rb.left)
+        right = min(right,  rb.right)
+        bottom = max(bottom, rb.bottom)
+        top = min(top,    rb.top)
+        if not (left < right and bottom < top):
+            raise ValueError(
+                "A bbox de corte não intersecta o raster.\n"
+                f"Raster bounds: {rb}\n"
+                f"BBox (no CRS do raster): left={left}, bottom={bottom}, right={right}, top={top}\n"
+                "Verifique se a bbox está mesmo em WGS84 (lon/lat).")
+        row_top, col_left = src.index(left,  top)
+        row_bottom, col_right = src.index(right, bottom)
+        row_off = max(0, min(row_top, row_bottom))
+        col_off = max(0, min(col_left, col_right))
+        row_max = min(src.height, max(row_top, row_bottom))
+        col_max = min(src.width,  max(col_left, col_right))
+        height_px = row_max - row_off
+        width_px = col_max - col_off
+        if height_px <= 0 or width_px <= 0:
+            raise ValueError("Janela de recorte vazia após ajuste aos limites do raster.")
+        win = Window.from_slices((row_off, row_max), (col_off, col_max))
+        out_transform = src.window_transform(win)
+        profile = src.profile.copy()
+        profile.update({
+            "height": height_px,
+            "width":  width_px,
+            "transform": out_transform})
+        tmp_out = path_out + ".clip_tmp.tif"
+        with rasterio.open(tmp_out, "w", **profile) as dst:
+            for b in range(1, src.count + 1):
+                dst.write(src.read(b, window=win), b)
+    os.replace(tmp_out, path_out)
+
+
 @lru_cache(maxsize=1)
 def _load_dem_meta(dem_path):
     with rasterio.open(dem_path) as src:
@@ -1036,7 +1370,7 @@ def get_roads_network(bbox_coords, vuln_weights, input_geojson, input_dem, outpu
     roads_gdf = roads_gdf[roads_gdf.geometry.type.isin(["LineString", "MultiLineString"])].copy().reset_index(drop=True)
     roads_gdf["burn_id"] = roads_gdf.index + 1
     roads_gdf["highway"] = roads_gdf["highway"].apply(lambda x: x[0] if isinstance(x, list) else x)
-    roads_gdf["name"] = roads_gdf.get("name", "").fillna("").replace("", "Sem nome")
+    roads_gdf["name"] = roads_gdf.get("name", "").fillna("").replace("", "Unnamed")
     roads_gdf["vuln_weight"] = (roads_gdf["highway"].map(vuln_weights).fillna(1).astype(int))
     df = roads_gdf[["burn_id", "name", "highway", "vuln_weight"]]
     df.to_excel(output_excel, index=False)
@@ -1108,58 +1442,111 @@ def get_hydrographic_network(bbox_coords, input_geojson, input_dem, output_raste
 
 def calculate_similarity(accumulated_flow, distances, thr, max_dist):
     max_flow = np.max(accumulated_flow)
-    threshold_value = max_flow * (thr / 100)
+    threshold_value = max_flow * (thr / 100.0)
     filtered_flow_ = np.where(accumulated_flow >= threshold_value, accumulated_flow, 0)
     nonzero_flow = filtered_flow_ > 0
     matching_pixels = np.sum(nonzero_flow & (distances <= max_dist))
     total_nonzero_flow = np.sum(nonzero_flow)
     similarity_percentage = (matching_pixels / total_nonzero_flow) * 100 if total_nonzero_flow > 0 else 0
-    return similarity_percentage, filtered_flow_, threshold_value/10
+    return similarity_percentage, filtered_flow_, threshold_value / 10.0
 
 
 def threshold_streams(accum_path, hidro_path, output_tif, output_img):
     log(pin, "Hydrologic Flow Analysis", color="black", font_size=14, font_weight="bold", icon_size=14)
     spinner = log_loading(loading, "Calibrating flow threshold to match hydrography...")
     print("\n⚙️ Calculando threshold do fluxo acumulado...")
-    thresholds = []
-    thresholds_values = []
-    similarities = []
-    best_similarity = -1.0
-    best_filtered_flow = None
-    best_threshold = None
-    best_threshold_value = None
+    max_distance = 1000
     with rasterio.open(accum_path) as src1:
         fluxo_acumulado = src1.read(1)
-        profile = src1.profile
+        profile = src1.profile.copy()
         pixel_size = src1.transform[0]
     with rasterio.open(hidro_path) as src2:
         rede_hidro = src2.read(1)
-    max_distance = 1000
-    rede_hidro_binaria = rede_hidro > 0
-    dists = distance_transform_edt(~rede_hidro_binaria) * pixel_size
     print(f"📐 Tamanho do pixel: {pixel_size}")
-    for threshold in np.arange(0.01, 50.01, 0.01):
-        similarity, filtered_flow, thr_value = calculate_similarity(fluxo_acumulado, dists, threshold, max_distance)
-        thresholds.append(threshold)
-        similarities.append(similarity)
-        thresholds_values.append(thr_value)
-        if similarity > best_similarity:
-            best_similarity = similarity
-            best_threshold = threshold
-            best_threshold_value = thr_value
-            best_filtered_flow = filtered_flow.copy()
-    with rasterio.open(output_tif, "w", **profile) as dst:
+    rede_hidro_binaria = rede_hidro > 0
+    del rede_hidro
+    dist_px = distance_transform_edt(~rede_hidro_binaria).astype(np.float32, copy=False)
+    max_px = max_distance / float(pixel_size)
+    within_maxdist = dist_px <= max_px
+    del dist_px, rede_hidro_binaria
+    flow = fluxo_acumulado.astype(np.float32, copy=False)
+    F = flow.ravel()
+    M = within_maxdist.ravel()
+    valid = np.isfinite(F)
+    if not np.all(valid):
+        F = F[valid]
+        M = M[valid]
+    if F.size == 0:
+        thresholds = np.arange(0.01, 50.01, 0.01, dtype=np.float32)
+        similarities = np.zeros_like(thresholds, dtype=np.float32)
+        plt.figure(figsize=(10, 6))
+        plt.plot(thresholds, similarities, marker='o', linestyle='-')
+        plt.xlabel("Threshold (%)")
+        plt.ylabel("Similarity (%)")
+        plt.grid()
+        plt.savefig(output_img, format="svg")
+        plt.close()
+        best_filtered_flow = np.zeros_like(flow, dtype=np.float32)
         nodata_value = profile.get('nodata', None)
         if nodata_value is not None:
             best_filtered_flow = np.where(best_filtered_flow == nodata_value, 0, best_filtered_flow)
+            profile.pop('nodata', None)
+        profile.update(dtype='float32', count=1, compress='lzw', BIGTIFF='IF_SAFER')
+        with rasterio.open(output_tif, "w", **profile) as dst:
+            dst.write(best_filtered_flow, 1)
+        print(f"🧠 Melhor threshold: 0 (0.00%) - 0.00% similar")
+        spinner()
+        log(pasta, f"File: {output_tif} — Drainage raster (thresholded flow accumulation)")
+        log(pixel, f"Pixel size: {pixel_size:.2f} m")
+        log(best, f"Best threshold: {0.00:.2f}% ({0:.0f}) — {0.00:.2f}% match with hydro mask")
+        log_image(output_img, description="Flow Threshold Calibration Curve:")
+        return
+    order = np.argsort(F, kind="stable")
+    F_sorted = F[order]
+    M_sorted = M[order].astype(np.int64, copy=False)
+    del F, M
+    cum_M_asc = np.cumsum(M_sorted)
+    total_M = int(cum_M_asc[-1]) if cum_M_asc.size else 0
+    N = F_sorted.size
+    maxF = float(F_sorted[-1])
+    thresholds = np.arange(0.01, 50.01, 0.01, dtype=np.float32)
+    if maxF <= 0:
+        similarities = np.zeros_like(thresholds, dtype=np.float32)
+        best_idx = 0
+        best_threshold = float(thresholds[best_idx])
+        best_similarity = float(similarities[best_idx])
+        best_threshold_value = 0.0
+        best_tau = 0.0
+    else:
+        tau_vals = (thresholds / 100.0) * maxF
+        idxs = np.searchsorted(F_sorted, tau_vals, side='left')
+        k = (N - idxs).astype(np.int64)
+        cum_M_geq = np.empty_like(k, dtype=np.int64)
+        nonzero = idxs > 0
+        cum_M_geq[nonzero]  = total_M - cum_M_asc[idxs[nonzero] - 1]
+        cum_M_geq[~nonzero] = total_M
+        with np.errstate(divide='ignore', invalid='ignore'):
+            similarities = np.where(k > 0, (cum_M_geq / k) * 100.0, 0.0).astype(np.float32)
+        best_idx = int(np.argmax(similarities)) if similarities.size else 0
+        best_threshold = float(thresholds[best_idx])
+        best_similarity = float(similarities[best_idx])
+        best_tau = (best_threshold / 100.0) * maxF
+        best_threshold_value = (best_tau / 10.0)
+    best_filtered_flow = np.where(flow >= best_tau, flow, 0).astype(np.float32, copy=False)
+    nodata_value = profile.get('nodata', None)
+    if nodata_value is not None:
+        best_filtered_flow = np.where(best_filtered_flow == nodata_value, 0, best_filtered_flow)
         profile.pop('nodata', None)
-        dst.write(best_filtered_flow.astype(rasterio.float32), 1)
+    profile.update(dtype='float32', count=1, compress='lzw', BIGTIFF='IF_SAFER')
+    with rasterio.open(output_tif, "w", **profile) as dst:
+        dst.write(best_filtered_flow, 1)
     plt.figure(figsize=(10, 6))
     plt.plot(thresholds, similarities, marker='o', linestyle='-')
     plt.xlabel("Threshold (%)")
     plt.ylabel("Similarity (%)")
     plt.grid()
     plt.savefig(output_img, format="svg")
+    plt.close()
     print(f"🧠 Melhor threshold: {best_threshold_value:.0f} ({best_threshold:.2f}%) - {best_similarity:.2f}% similar")
     spinner()
     log(pasta, f"File: {output_tif} — Drainage raster (thresholded flow accumulation)")
@@ -1168,7 +1555,7 @@ def threshold_streams(accum_path, hidro_path, output_tif, output_img):
     log_image(output_img, description="Flow Threshold Calibration Curve:")
 
 
-def calculate_HAND(filled_path, drainage_path, output_path):
+def calculate_HAND(filled_path, drainage_path, output_path, bbox_ext=None):
     log(pin, "Susceptibility Calculation", color="black", font_size=14, font_weight="bold", icon_size=14)
     print("\n⚙️ Calculando o HAND...")
     wbt = WhiteboxTools()
@@ -1179,6 +1566,11 @@ def calculate_HAND(filled_path, drainage_path, output_path):
     wbt.elevation_above_stream(dem=DEM_HAND, streams=STREAMS_HAND, output=HAND)
     log(pasta, f"File: {output_path} — Raw HAND values")
     print("✅ HAND calculado com sucesso")
+    if bbox_ext is not None:
+        print("✂️  Recortando o HAND à bbox (WGS84)…")
+        clip_raster_to_bbox_wgs84(HAND, HAND, bbox_ext)
+        print("✅ Recorte concluído")
+    return HAND
 
 
 def _find_saga_cmd():
@@ -1193,15 +1585,13 @@ def _find_saga_cmd():
     candidates = [
         os.path.join(sys.prefix, "Library", "bin", "saga_cmd.exe"),
         os.path.join(sys.prefix, "bin", "saga_cmd.exe"),
-        os.path.join(sys.prefix, "Scripts", "saga_cmd.exe"),
-    ]
+        os.path.join(sys.prefix, "Scripts", "saga_cmd.exe"),]
     candidates += [
         r"C:\OSGeo4W64\bin\saga_cmd.exe",
         r"C:\OSGeo4W\bin\saga_cmd.exe",
         r"C:\Program Files\SAGA-GIS\saga_cmd.exe",
         r"C:\Program Files\SAGA GIS LTR\saga_cmd.exe",
-        r"C:\Users\igors\Documents\saga-9.8.0_x64\saga_cmd.exe",  # seu local
-    ]
+        r"C:\Users\igors\Documents\saga-9.8.0_x64\saga_cmd.exe",]
     which = shutil.which("saga_cmd.exe") or shutil.which("saga_cmd")
     if which:
         candidates.insert(0, which)
@@ -1210,14 +1600,13 @@ def _find_saga_cmd():
             return c
     raise FileNotFoundError(
         "saga_cmd.exe não encontrado.\n"
-        "Defina SAGA_CMD com o caminho para saga_cmd.exe ou instale SAGA (OSGeo/standalone)."
-    )
+        "Defina SAGA_CMD com o caminho para saga_cmd.exe ou instale SAGA (OSGeo/standalone).")
+
 
 def _detect_mrvbf_tool_id(saga_cmd_path: str) -> str:
     try:
-        out = subprocess.run([saga_cmd_path, "ta_morphometry", "-h"],
-                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, check=True).stdout
+        out = subprocess.run([saga_cmd_path, "ta_morphometry", "-h"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, check=True).stdout
         m = re.search(r'\[(\d+)\]\s.*MRVBF', out, flags=re.IGNORECASE)
         if m:
             return m.group(1)
@@ -1225,191 +1614,420 @@ def _detect_mrvbf_tool_id(saga_cmd_path: str) -> str:
         pass
     return "8"
 
-def calcular_mrvbf(dem_path, output_path):
-    print("\n⚙️ Calculando o MRVBF...")
-    if sys.platform.startswith("win"):
-        lib_bin = os.path.join(sys.prefix, "Library", "bin")
-        os.environ["PATH"] = lib_bin + os.pathsep + os.environ.get("PATH", "")
-        try:
-            os.add_dll_directory(lib_bin)
-        except Exception:
-            pass
-        os.environ["GDAL_DATA"] = os.path.join(sys.prefix, "Library", "share", "gdal")
-        os.environ["PROJ_LIB"]  = os.path.join(sys.prefix, "Library", "share", "proj")
+
+def _prepare_saga_env_from_exe(saga_exe: str):
+    env = os.environ.copy()
+    saga_dir = Path(saga_exe).parent
+    env["PATH"] = str(saga_dir) + os.pathsep + env.get("PATH", "")
+    candidates = [
+        saga_dir / "modules",
+        saga_dir / "tools",
+        saga_dir.parent / "apps" / "saga" / "modules",
+        saga_dir.parent / "apps" / "saga" / "tools",]
+    for c in candidates:
+        if c.is_dir():
+            env.setdefault("SAGA_MLB", str(c))
+            env.setdefault("SAGA_TLB", str(c))
+            break
+    return env, str(saga_dir)
+
+
+def calcular_mrvbf(dem_path, output_path, wmax_px=243, bbox_ext=None):
+    print("\n⚙️ Calculando o MRVBF (6 níveis, Wmax=243 px)…")
+    spinner = log_loading(loading, "Calculating MRVBF...")
     base_dir = os.path.dirname(__file__)
     input_dem = os.path.join(base_dir, dem_path)
     mrvbf_out = os.path.join(base_dir, output_path)
-    os.makedirs(os.path.dirname(mrvbf_out), exist_ok=True)
-    saga_cmd = _find_saga_cmd()
-    print("SAGA_CMD =", saga_cmd)  # debug útil
-    subprocess.run([saga_cmd, "--version"], check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    tool_id = _detect_mrvbf_tool_id(saga_cmd)
-    cmd = [saga_cmd, "ta_morphometry", tool_id,
-           "-DEM", input_dem,
-           "-MRVBF", mrvbf_out]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    with rasterio.open(input_dem) as ds:
+        width_px, height_px = ds.width, ds.height
+        transform = ds.transform
+        crs = ds.crs
+        res_x = abs(transform.a)
+        res_y = abs(transform.e)
+        if crs and crs.is_geographic:
+            bounds = ds.bounds
+            lat_c = 0.5 * (bounds.top + bounds.bottom)
+            m_per_lat = 110_574.0
+            m_per_lon = 111_320.0 * math.cos(math.radians(lat_c))
+            res_m_x = res_x * m_per_lon
+            res_m_y = res_y * m_per_lat
+        else:
+            res_m_x = res_x
+            res_m_y = res_y
+        res_m = 0.5 * (res_m_x + res_m_y)
+        D_px = math.hypot(width_px, height_px)
+    t_slope = 116.57 * (res_m ** -0.62)
+    max_res_percent = 100.0 * (wmax_px / D_px)
+    max_res_percent = max(0.0001, min(max_res_percent, 100.0))
+    print(f"   • Resolução média ≈ {res_m:.2f} m")
+    print(f"   • T_SLOPE (RSAGA) = {t_slope:.3f}")
+    print(f"   • Diâmetro (px) = {D_px:.1f}  →  -MAX_RES = {max_res_percent:.6f}% (Wmax={wmax_px}px)")
+    saga_exe = _find_saga_cmd()
+    tool_id = _detect_mrvbf_tool_id(saga_exe)
+    env, cwd = _prepare_saga_env_from_exe(saga_exe)
+    if not os.path.isfile(input_dem):
+        raise FileNotFoundError(f"DEM not found: {input_dem}")
+    cmd = [
+        saga_exe, "ta_morphometry", tool_id,
+        "-DEM", input_dem,
+        "-MRVBF", mrvbf_out,
+        "-T_SLOPE", f"{t_slope:.3f}",
+        "-MAX_RES", f"{max_res_percent:.6f}",
+        "-CLASSIFY", "0"]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=cwd)
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            "saga_cmd.exe não foi encontrado. Instale o SAGA ou defina a variável de ambiente SAGA_CMD "
+            "apontando para o executável (ex.: C:\\OSGeo4W64\\bin\\saga_cmd.exe)."
+        ) from e
+    if result.returncode != 0:
+        print("❌ Erro ao calcular MRVBF com SAGA GIS")
+        print("---- STDOUT ----")
+        print(result.stdout.strip())
+        print("---- STDERR ----")
+        print(result.stderr.strip())
+        raise RuntimeError("Falha na execução do SAGA GIS.")
     if result.returncode != 0:
         print("❌ Erro ao calcular MRVBF com SAGA GIS:")
-        print(result.stderr.strip() or result.stdout)
-        raise RuntimeError("Falha na execução do SAGA GIS (MRVBF).")
-    print(f"✅ MRVBF gerado com sucesso: {mrvbf_out}")
-    log(pasta, f"File: {output_path} — Raw MRVBF values")
-    return mrvbf_out
-
-
-def reclassificar_hand(input_path, output_path):
-    print("\n⚙️ Reclassificando HAND em 5 faixas de suscetibilidade...")
-    base_dir = os.path.dirname(__file__)
-    hand_path = os.path.join(base_dir, input_path)
-    hand_class_path = os.path.join(base_dir, output_path)
-    with rasterio.open(hand_path) as src:
-        hand = src.read(1)
-        profile = src.profile
-        original_nodata = src.nodata
-        classified = np.full_like(hand, 255, dtype=np.uint8)  # 255 = nodata para uint8
-        valid_mask = (hand != original_nodata)
-        classified[(hand <= 1) & valid_mask] = 5
-        classified[(hand > 1) & (hand <= 2) & valid_mask] = 4
-        classified[(hand > 2) & (hand <= 4) & valid_mask] = 3
-        classified[(hand > 4) & (hand <= 6) & valid_mask] = 2
-        classified[(hand > 6) & valid_mask] = 1
-        profile.update(dtype=rasterio.uint8, count=1, nodata=255)
-    with rasterio.open(hand_class_path, 'w', **profile) as dst:
-        dst.write(classified, 1)
-    print(f"✅ HAND reclassificado com sucesso")
-    log(pasta, f"File: {output_path} — Reclassified HAND (1 to 5)")
-    return hand_class_path
-
-
-def reclassificar_mrvbf(input_path, output_path):
-    print("\n⚙️ Reclassificando MRVBF em 5 faixas de suscetibilidade...")
-    base_dir = os.path.dirname(__file__)
-    mrvbf_path = os.path.join(base_dir, input_path)
-    mrvbf_class_path = os.path.join(base_dir, output_path)
-    with rasterio.open(mrvbf_path) as src:
-        mrvbf = src.read(1)
-        profile = src.profile
-        original_nodata = src.nodata
-        classified = np.full_like(mrvbf, 255, dtype=np.uint8)
-        valid_mask = (mrvbf != original_nodata)
-        classified[(mrvbf >= 0) & (mrvbf < 1) & valid_mask] = 1
-        classified[(mrvbf >= 1) & (mrvbf < 3) & valid_mask] = 2
-        classified[(mrvbf >= 3) & (mrvbf < 5) & valid_mask] = 3
-        classified[(mrvbf >= 5) & (mrvbf < 8) & valid_mask] = 4
-        classified[(mrvbf >= 8) & valid_mask] = 5
-        profile.update(dtype=rasterio.uint8, count=1, nodata=255)
-    with rasterio.open(mrvbf_class_path, 'w', **profile) as dst:
-        dst.write(classified, 1)
-    print(f"✅ MRVBF reclassificado com sucesso")
-    log(pasta, f"File: {output_path} — Reclassified MRVBF (1 to 5)")
-    return mrvbf_class_path
-
-
-def calcular_indice_ahp(input_path_1, input_path_2, output_path, peso_hand, peso_mrvbf):
-    print("\n⚙️ Calculando índice final de suscetibilidade...")
-    base_dir = os.path.dirname(__file__)
-    hand_path = os.path.join(base_dir, input_path_1)
-    mrvbf_path = os.path.join(base_dir, input_path_2)
-    output_path_ = os.path.join(base_dir, output_path)
-    with rasterio.open(hand_path) as hand_src, rasterio.open(mrvbf_path) as mrvbf_src:
-        hand = hand_src.read(1).astype(np.float32)
-        mrvbf = mrvbf_src.read(1).astype(np.float32)
-        hand_nodata = hand_src.nodata
-        mrvbf_nodata = mrvbf_src.nodata
-        combined_nodata = 255
-        valid_mask = (hand != hand_nodata) & (mrvbf != mrvbf_nodata)
-        indice = np.full_like(hand, combined_nodata, dtype=np.float32)
-        indice[valid_mask] = (hand[valid_mask] * peso_hand + mrvbf[valid_mask] * peso_mrvbf)
-        profile = hand_src.profile
-        profile.update(dtype=rasterio.float32, nodata=combined_nodata)
-    with rasterio.open(output_path_, 'w', **profile) as dst:
-        dst.write(indice, 1)
-    print(f"✅ Índice AHP gerado com sucesso")
-    log(pasta, f"File: {output_path} — Susceptibility index (continuous values)")
-    return output_path_
-
-
-def reclassificar_indice_ahp(input_path, output_path):
-    print("\n⚙️ Reclassificando índice AHP em 5 faixas qualitativas...")
-    base_dir = os.path.dirname(__file__)
-    indice_path = os.path.join(base_dir, input_path)
-    classificado_path = os.path.join(base_dir, output_path)
-    with rasterio.open(indice_path) as src:
-        indice = src.read(1)
-        profile = src.profile
-        original_nodata = src.nodata
-        classificado = np.full_like(indice, 255, dtype=np.uint8)
-        valid_mask = (indice != original_nodata)
-        classificado[(indice < 2.0) & valid_mask] = 1
-        classificado[(indice >= 2.0) & (indice < 3.0) & valid_mask] = 2
-        classificado[(indice >= 3.0) & (indice < 4.0) & valid_mask] = 3
-        classificado[(indice >= 4.0) & (indice < 4.5) & valid_mask] = 4
-        classificado[(indice >= 4.5) & valid_mask] = 5
-        profile.update(dtype=rasterio.uint8, nodata=255, count=1)
-    with rasterio.open(classificado_path, 'w', **profile) as dst:
-        dst.write(classificado, 1)
-    print(f"✅ Índice classificado com sucesso")
-    log(pasta, f"File: {output_path} — Reclassified susceptibility (1 to 5)")
-    return classificado_path
-
-
-def smooth_recursive(input_path, output_path, mode_window, selem_radius, min_size_pixels, max_iters, tol_change):
-    print("\n⚙️ Suavizando suscetibilidade...")
-    with rasterio.open(input_path) as src:
-        arr = src.read(1)
-        profile = src.profile
-        nodata = src.nodata
-    selem = disk(selem_radius)
-    def mode_filter(a):
-        vals, cnts = np.unique(a[a != nodata], return_counts=True)
-        return vals[np.argmax(cnts)] if vals.size else nodata
-    prev = arr.copy()
-    for i in range(1, max_iters + 1):
-        spinner = log_loading(loading, f"Smoothing susceptibility ({i}/{max_iters})...")
-        arr_mode = generic_filter(prev, mode_filter, size=mode_window, mode='nearest')
-        arr_open = opening(arr_mode, selem)
-        arr_close = closing(arr_open, selem)
-        smoothed = arr_close.copy()
-        structure = np.ones((3,3), dtype=int)
-        labeled, nfeat = label(smoothed != nodata, structure=structure)
-        for rid in range(1, nfeat+1):
-            mask = (labeled == rid)
-            if mask.sum() < min_size_pixels:
-                border = binary_dilation(mask, structure=structure) & (~mask)
-                neigh = smoothed[border]
-                neigh = neigh[neigh != nodata]
-                if neigh.size:
-                    vals, cnts = np.unique(neigh, return_counts=True)
-                    replacement = vals[np.argmax(cnts)]
-                    smoothed[mask] = replacement
-        nodatamask = (smoothed == nodata)
-        if nodatamask.any():
-            labeled_n, nf2 = label(nodatamask, structure=structure)
-            for rid in range(1, nf2+1):
-                mask = (labeled_n == rid)
-                border = binary_dilation(mask, structure=structure) & (~mask)
-                neigh = smoothed[border]
-                neigh = neigh[neigh != nodata]
-                if neigh.size:
-                    vals, cnts = np.unique(neigh, return_counts=True)
-                    replacement = vals[np.argmax(cnts)]
-                    smoothed[mask] = replacement
-        changes = np.count_nonzero(prev != smoothed)
-        print(f"🔄 Iteração {i}/{max_iters}: pixels alterados = {changes}")
-        log(info, f"Iteration {i}/{max_iters}: {changes} pixels updated")
-        if tol_change > 0 and changes <= tol_change:
-            print("✅ Convergido! Parando as iterações")
-            prev = smoothed
-            break
-        prev = smoothed
+        print(result.stderr)
+        raise RuntimeError("Falha na execução do SAGA GIS.")
+    print("✅ MRVBF gerado com sucesso")
+    if bbox_ext is not None:
+        print("✂️  Recortando o MRVBF à bbox (WGS84)…")
+        clip_raster_to_bbox_wgs84(mrvbf_out, mrvbf_out, bbox_ext)
+        print("✅ Recorte concluído")
         spinner()
-    profile.update(dtype=rasterio.uint8, nodata=nodata, count=1)
-    with rasterio.open(output_path, 'w', **profile) as dst:
-        dst.write(prev.astype(rasterio.uint8), 1)
-    print("✅ Suavização realizada com sucesso")
-    log(pasta, f"File: {output_path} — Smoothed final susceptibility map")
-    return prev
+    try:
+        log(pasta, f"File: {output_path} — Raw MRVBF values")
+    except Exception:
+        pass
+    meta = {
+        "t_slope": t_slope,
+        "max_res_percent": max_res_percent,
+        "wmax_px": wmax_px,
+        "res_m": res_m,
+        "clipped": bbox_ext is not None}
+    return mrvbf_out, meta
+
+
+def calculate_susceptibility(path_handraw, path_mrvbfraw, path_rivermask, path_rfmodel, path_susc, BUFFER_M, MRVBF_HIGH_LEVEL, CHUNK_PRED, K=5):
+    if "LOKY_MAX_CPU_COUNT" not in os.environ:
+        try:
+            import psutil
+            n_phys = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+        except Exception:
+            n_phys = os.cpu_count() or 1
+        os.environ["LOKY_MAX_CPU_COUNT"] = str(n_phys)
+    warnings.filterwarnings("ignore", category=UserWarning, module=r"joblib\.externals\.loky\.backend\.context")
+    warnings.filterwarnings("ignore", category=UserWarning, module=r".*loky\.backend\.context$")
+
+    def _safe_phys_tuple():
+        try:
+            n = int(os.environ.get("LOKY_MAX_CPU_COUNT", ""))
+            if n <= 0:
+                raise ValueError
+            return n, None
+        except Exception as e:
+            return (os.cpu_count() or 1), e
+
+    for modname in ("joblib.externals.loky.backend.context", "loky.backend.context"):
+        ctx = sys.modules.get(modname)
+        if ctx:
+            try:
+                setattr(ctx, "_count_physical_cores", _safe_phys_tuple)
+                setattr(ctx, "_count_physical_cores_win32", _safe_phys_tuple)
+            except Exception:
+                pass
+
+    def _cpu_count_public(only_physical_cores=False):
+        if only_physical_cores:
+            return _safe_phys_tuple()[0]
+        return os.cpu_count() or _safe_phys_tuple()[0]
+
+    for pkgname in ("joblib.externals.loky", "loky"):
+        pkg = sys.modules.get(pkgname)
+        if pkg:
+            try:
+                setattr(pkg, "cpu_count", _cpu_count_public)
+            except Exception:
+                pass
+    spinner = log_loading(loading, "Processing susceptibility...")
+
+    def read_raster(path):
+        ds = rasterio.open(path)
+        arr = ds.read(1)
+        prof = ds.profile.copy()
+        return ds, arr, prof
+
+    def reproject_match(src_arr, src_prof, dst_prof, resampling=Resampling.bilinear):
+        dst = np.full((dst_prof['height'], dst_prof['width']), np.nan, dtype=np.float32)
+        reproject(
+            source=src_arr.astype(np.float32),
+            destination=dst,
+            src_transform=src_prof['transform'],
+            src_crs=src_prof['crs'],
+            dst_transform=dst_prof['transform'],
+            dst_crs=dst_prof['crs'],
+            src_nodata=src_prof.get('nodata', None),
+            dst_nodata=np.nan,
+            resampling=resampling)
+        return dst
+
+    def pixel_size_m(transform):
+        px = abs(transform.a)
+        py = abs(transform.e)
+        return float((px + py) / 2.0) if px > 0 and py > 0 else 1.0
+
+    def build_river_masks(river_path, ref_shape, ref_transform, ref_crs, buffer_m):
+        from shapely.geometry import shape as shp_shape
+        from shapely.ops import unary_union
+        import geopandas as gpd
+
+        def _geom_to_mask(geom, buf_m):
+            if geom is None: return np.zeros(ref_shape, dtype=bool)
+            g = geom.buffer(buf_m) if buf_m != 0 else geom
+            if g.is_empty: return np.zeros(ref_shape, dtype=bool)
+            mk = rasterize([(g, 1)], out_shape=ref_shape, transform=ref_transform, fill=0, dtype='uint8', all_touched=True)
+            return mk.astype(bool)
+
+        ext = os.path.splitext(river_path.lower())[1]
+        if ext in (".tif", ".tiff"):
+            with rasterio.open(river_path) as src:
+                arr = src.read(1)
+                arr_match = reproject_match(arr, src.profile, {
+                    'transform': ref_transform, 'crs': ref_crs,
+                    'height': ref_shape[0], 'width': ref_shape[1]},
+                    resampling=Resampling.nearest)
+            river_bool = np.isfinite(arr_match) & (arr_match > 0)
+            geoms = []
+            for geom, val in shapes(river_bool.astype(np.uint8), mask=river_bool.astype(np.uint8), transform=ref_transform):
+                if val == 1:
+                    geoms.append(shp_shape(geom))
+            union = unary_union(geoms) if geoms else None
+            core = _geom_to_mask(union, 0.0)
+            buff = _geom_to_mask(union, buffer_m)
+            return core, buff
+        else:
+            gdf = gpd.read_file(river_path)
+            if gdf.empty: return np.zeros(ref_shape, bool), np.zeros(ref_shape, bool)
+            if gdf.crs is None: raise ValueError("Vetor de rios sem CRS.")
+            gdf = gdf.to_crs(ref_crs)
+            union = unary_union(gdf.geometry)
+            core = _geom_to_mask(union, 0.0)
+            buff = _geom_to_mask(union, buffer_m)
+            return core, buff
+
+    def score_signature(score, valid_mask, ps):
+        s = score[valid_mask]
+        s = s[np.isfinite(s)]
+        if s.size == 0:
+            return None
+        qs = np.quantile(s, np.array(ps, dtype=float)/100.0)
+        return qs.astype(float)
+
+    def mix_cuts_by_proto(th_json, K, sig_new, allow_extrapolation=True):
+        proto = th_json.get("proto", None)
+        if not proto:
+            return None, None, None
+        keys = proto.get("keys", [])
+        if len(keys) != 2:
+            return None, None, None
+        k0, k1 = keys[0], keys[1]
+        sig_p = proto["signature"]["p"]
+        qa = np.array(proto["signature"][k0]["q"], dtype=float)
+        qb = np.array(proto["signature"][k1]["q"], dtype=float)
+        if sig_new is None or len(sig_new) != len(qa):
+            return None, None, None
+        v = qb - qa
+        denom = float(np.dot(v, v)) + 1e-12
+        alpha = float(np.dot(sig_new - qa, v) / denom)
+        if not allow_extrapolation:
+            alpha = max(0.0, min(1.0, alpha))
+        Ka = np.array(proto["cuts"][k0][str(K)], dtype=float)
+        Kb = np.array(proto["cuts"][k1][str(K)], dtype=float)
+        mixed = Ka + alpha * (Kb - Ka)
+        for i in range(1, mixed.size):
+            if not (mixed[i] > mixed[i-1]):
+                mixed[i] = np.nextafter(mixed[i-1], np.inf)
+        return mixed.astype(float), alpha, (k0, k1)
+
+    def compute_features(hand, mrvbf, in_channel_bool, transform):
+        H, W = hand.shape
+        px_m = pixel_size_m(transform)
+        dist_pix = distance_transform_edt(in_channel_bool == 0)
+        dist_m = dist_pix.astype(np.float32) * float(px_m)
+        in_buffer = (dist_m <= float(BUFFER_M)).astype(np.float32)
+        HAND = hand.astype(np.float32, copy=False)
+        MRV = mrvbf.astype(np.float32, copy=False)
+        INCH = in_channel_bool.astype(np.float32, copy=False)
+        DST = dist_m.astype(np.float32, copy=False)
+        T_high = float(MRVBF_HIGH_LEVEL)
+        mrvbf_high = (np.isfinite(MRV) & (MRV >= T_high)).astype(np.float32)
+        k = max(1, int(round(float(BUFFER_M) / max(px_m, 1e-6))) * 2 + 1)
+        plain_frac100 = uniform_filter(mrvbf_high, size=k, mode="nearest")
+        m_buf = MRV[(in_buffer > 0) & np.isfinite(MRV)]
+        ctx_planarity = float(np.mean(m_buf >= T_high)) if m_buf.size > 0 else 0.0
+        ctx_mrvbf_p90 = float(np.percentile(m_buf, 90)) if m_buf.size > 0 else 0.0
+        CTX = np.full_like(HAND, ctx_planarity, dtype=np.float32)
+        CTXp90 = np.full_like(HAND, ctx_mrvbf_p90, dtype=np.float32)
+        HAND_scaled_1 = HAND / (1.0 + 0.75 * plain_frac100 + 1e-6)
+        HAND_scaled_2 = HAND * (1.0 - 0.50 * plain_frac100)
+        HAND_eff = HAND / (1e-3 + plain_frac100)
+        HANDxMRV = HAND * MRV
+        LOG_DST = np.log1p(DST).astype(np.float32)
+        valid_hand = np.isfinite(HAND)
+        if np.any(valid_hand):
+            mu = float(np.nanmean(HAND[valid_hand]))
+            sd = float(np.nanstd(HAND[valid_hand]) + 1e-6)
+        else:
+            mu, sd = 0.0, 1.0
+        HAND_z = ((HAND - mu) / sd).astype(np.float32)
+        HAND_rank = np.zeros_like(HAND, dtype=np.float32)
+        if np.any(valid_hand):
+            hs = np.sort(HAND[valid_hand])
+            idx = np.searchsorted(hs, HAND[valid_hand], side="right")
+            HAND_rank[valid_hand] = idx.astype(np.float32) / float(hs.size)
+        feat_dict = {
+            "HAND": HAND,
+            "MRVBF": MRV,
+            "in_channel": INCH,
+            "dist_to_channel_m": DST,
+            "log_dist_m": LOG_DST,
+            "in_buffer": in_buffer,
+            "plain_frac100": plain_frac100,
+            "ctx_planarity": CTX,
+            "ctx_mrvbf_p90": CTXp90,
+            "HAND_scaled_1": HAND_scaled_1,
+            "HAND_scaled_2": HAND_scaled_2,
+            "HANDxMRVBF": HANDxMRV,
+            "HAND_eff": HAND_eff,
+            "HAND_z": HAND_z,
+            "HAND_rank": HAND_rank}
+        return feat_dict
+
+    def predict_in_chunks(model, X, chunk=300_000):
+        n = X.shape[0]
+        out = np.empty(n, dtype=np.float32)
+        s = 0
+        while s < n:
+            e = min(s + chunk, n)
+            out[s:e] = model.predict(X[s:e]).astype(np.float32)
+            s = e
+        return out
+
+    def load_artifacts(model_dir):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            from joblib import load
+            model_path = os.path.join(model_dir, "model_hgbr.joblib")
+            fo_path = os.path.join(model_dir, "feature_order.json")
+            cfg_path = os.path.join(model_dir, "config.json")
+            th_path = os.path.join(model_dir, "score_thresholds.json")
+            if not os.path.isfile(model_path): sys.exit("model_hgbr.joblib não encontrado.")
+            if not os.path.isfile(fo_path): sys.exit("feature_order.json não encontrado.")
+            if not os.path.isfile(th_path): sys.exit("score_thresholds.json não encontrado.")
+            model = load(model_path)
+        with open(fo_path, "r", encoding="utf-8") as f:
+            foj = json.load(f)
+        feat_names = foj.get("feature_names")
+        if not feat_names: sys.exit("feature_names ausente em feature_order.json.")
+        with open(th_path, "r", encoding="utf-8") as f:
+            thresholds = json.load(f)
+        cfg = {}
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        return model, feat_names, thresholds, cfg
+
+    os.makedirs(os.path.dirname(path_susc) or ".", exist_ok=True)
+    hds, hand_arr, hprof = read_raster(path_handraw)
+    transform = hprof['transform']; crs = hprof['crs']
+    shape = (hprof['height'], hprof['width'])
+    hand = hand_arr.astype(np.float32)
+    if hprof.get('nodata') is not None:
+        hand[hand == hprof['nodata']] = np.nan
+    mds, mrvbf_arr, mprof = read_raster(path_mrvbfraw)
+    mrvbf = reproject_match(mrvbf_arr, mprof, hprof, resampling=Resampling.bilinear)
+    print("\n⚙️ Calculando suscetibilidade...")
+    river_core, river_buff = build_river_masks(path_rivermask, shape, transform, crs, buffer_m=BUFFER_M)
+    model, feat_order, thresholds_json, cfg = load_artifacts(path_rfmodel)
+    in_channel_bool = river_core.astype(bool)
+    feats = compute_features(hand, mrvbf, in_channel_bool, transform)
+    valid = np.isfinite(hand) & np.isfinite(mrvbf)
+    X = np.column_stack([feats[name][valid] for name in feat_order]).astype(np.float32, copy=False)
+    score = np.full(shape, np.nan, dtype=np.float32)
+    yhat = predict_in_chunks(model, X, chunk=CHUNK_PRED)
+    score[valid] = yhat
+    cuts = None
+    alpha = None
+    proto_keys = None
+    ps = thresholds_json["proto"]["signature"]["p"]
+    sig_new = score_signature(score, valid, ps)
+    cuts, alpha, proto_keys = mix_cuts_by_proto(thresholds_json, K, sig_new, allow_extrapolation=True)
+    if cuts is None:
+        raise RuntimeError("Cortes 'proto' indisponíveis em score_thresholds.json.")
+    out_z = np.full(shape, 255, dtype=np.uint8)
+    if np.any(valid):
+        z = np.digitize(score[valid], cuts) + 1
+        z = (K + 1) - z
+        z = np.clip(z, 1, K).astype(np.uint8)
+        out_z[valid] = z
+    out_z[river_core & np.isfinite(hand) & np.isfinite(mrvbf)] = K
+    out_profile = hprof.copy()
+    out_profile.update(dtype=rasterio.uint8, count=1, nodata=255, compress="deflate")
+    with rasterio.open(path_susc, "w", **out_profile) as dst:
+        dst.write(out_z, 1)
+        dst.update_tags(
+            DESCRIPTION=f"Susceptibility 1..{K}; 1=least critical, {K}=most critical; forced {K} on river core",
+            BUFFER_M=str(BUFFER_M),
+            MRVBF_HIGH_LEVEL=str(MRVBF_HIGH_LEVEL),
+            CUT_POLICY="proto",
+            K=str(K),
+            FEATURES=json.dumps(feat_order, ensure_ascii=False),
+            LABEL_ORIENTATION="1=least_critical;K=most_critical",
+            PROTO_KEYS=(json.dumps(proto_keys) if proto_keys else ""),
+            PROTO_ALPHA=(f"{alpha:.6f}" if alpha is not None else ""))
+    spinner()
+    log(pasta, f"File: {path_susc} — Susceptibility file")
+    print("✅ Suscetibilidade calculada com sucesso")
+    return out_z
+
+
+def _reproject_match_array(src_arr, src_prof, dst_transform, dst_crs, dst_height, dst_width, resampling=Resampling.nearest):
+    dst = np.full((dst_height, dst_width), 0, dtype=src_arr.dtype)
+    reproject(
+        source=src_arr,
+        destination=dst,
+        src_transform=src_prof['transform'],
+        src_crs=src_prof['crs'],
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        src_nodata=src_prof.get('nodata', None),
+        dst_nodata=0,
+        resampling=resampling)
+    return dst
+
+
+def _cartopy_crs_from_rasterio(crs):
+    try:
+        epsg = crs.to_epsg()
+        if epsg:
+            return ccrs.epsg(epsg)
+    except Exception:
+        pass
+    try:
+        if crs.is_geographic:
+            return ccrs.PlateCarree()
+    except Exception:
+        pass
+    return ccrs.PlateCarree()
 
 
 def visualizar_suscetibilidade(susc_path_, rios_path_, vias_path_, output_path_):
@@ -1425,25 +2043,50 @@ def visualizar_suscetibilidade(susc_path_, rios_path_, vias_path_, output_path_)
         susc_crs = src.crs
         susc_extent = rasterio.plot.plotting_extent(src)
         susc_nodata = src.nodata
+        H, W = src.height, src.width
+    susc_masked = np.ma.masked_equal(susc_data, susc_nodata)
     with rasterio.open(rios_path) as rio_src:
-        rios = rio_src.read(1)
+        rios_arr = rio_src.read(1)
+        rios_prof = rio_src.profile.copy()
+    rios_match = _reproject_match_array(
+        rios_arr, rios_prof,
+        dst_transform=susc_transform, dst_crs=susc_crs,
+        dst_height=H, dst_width=W,
+        resampling=Resampling.nearest)
+    rios_mask = np.ma.masked_less_equal(rios_match, 0)
     with rasterio.open(vias_path) as via_src:
-        vias = via_src.read(1)
-    susc_data = np.ma.masked_equal(susc_data, susc_nodata)
-    cores = ["#1b5e20", "#a5d6a7", "#ffffb2", "#e6550d", "#a80000"]
+        vias_arr = via_src.read(1)
+        vias_prof = via_src.profile.copy()
+    vias_match = _reproject_match_array(
+        vias_arr, vias_prof,
+        dst_transform=susc_transform, dst_crs=susc_crs,
+        dst_height=H, dst_width=W,
+        resampling=Resampling.nearest)
+    vias_mask = np.ma.masked_less_equal(vias_match, 0)
+    cores = ["#1b5e20", "#a5d6a7", "#ffffb2", "#e6550d", "#a80000"]  # 1..5
     cmap = ListedColormap(cores)
     bounds = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
     norm = BoundaryNorm(bounds, cmap.N)
-    crs_proj = ccrs.UTM(susc_crs.to_dict()["zone"], southern_hemisphere=susc_crs.to_dict().get("south", False))
+    crs_proj = _cartopy_crs_from_rasterio(susc_crs)
     fig, ax = plt.subplots(figsize=(12, 10), subplot_kw={'projection': crs_proj})
     ax.set_extent(susc_extent, crs=crs_proj)
-    ax.imshow(susc_data, cmap=cmap, norm=norm, transform=crs_proj, extent=susc_extent, interpolation='nearest', alpha=0.75)
-    ax.imshow(np.ma.masked_not_equal(rios, 1), cmap=ListedColormap(["#66ccff"]), alpha=0.8, extent=susc_extent, transform=crs_proj)
-    ax.imshow(np.ma.masked_where(vias == 0, vias), cmap=ListedColormap(["#303030"]), alpha=0.6, extent=susc_extent, transform=crs_proj)
-    legend_labels = ['Muito Baixa', 'Baixa', 'Moderada', 'Alta', 'Muito Alta', 'Rede Hidrográfica', 'Malha Viária']
+    ax.imshow(
+        susc_masked,
+        cmap=cmap, norm=norm,
+        transform=crs_proj, extent=susc_extent,
+        interpolation='nearest', alpha=0.75)
+    ax.imshow(
+        rios_mask,
+        cmap=ListedColormap(["#66ccff"]),
+        alpha=0.8, extent=susc_extent, transform=crs_proj, interpolation='nearest')
+    ax.imshow(
+        vias_mask,
+        cmap=ListedColormap(["#303030"]),
+        alpha=0.6, extent=susc_extent, transform=crs_proj, interpolation='nearest')
+    legend_labels = ['Very Low', 'Low', 'Moderate', 'High', 'Very High', 'Hydrographic Network', 'Road Network']
     legend_colors = cores + ["#66ccff", "#303030"]
     legend_patches = [Patch(color=cor, label=label) for cor, label in zip(legend_colors, legend_labels)]
-    ax.legend(handles=legend_patches, loc='lower right', title='Suscetibilidade')
+    ax.legend(handles=legend_patches, loc='lower right', title='Susceptibility')
     gl = ax.gridlines(draw_labels=True, linestyle='--', linewidth=0.5)
     gl.top_labels = False
     gl.right_labels = False
@@ -1457,8 +2100,8 @@ def visualizar_suscetibilidade(susc_path_, rios_path_, vias_path_, output_path_)
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✅ Imagem salva com sucesso")
-    log(pasta, f"File: {output_path_} — Preview image of the smoothed susceptibility map")
-    log_image(output_path, description="Smoothed Susceptibility Map:")
+    log(pasta, f"File: {output_path_} — Preview image of the susceptibility map")
+    log_image(output_path, description="Susceptibility Map:")
     log_spacing("\n")
 
 
@@ -1498,8 +2141,7 @@ def get_poi_network(bbox_coords, tags_pesos, vehicular_highways, output_geojson,
             'geometry': geom,
             'type':     grp['type'].iat[0],
             'weight':   grp['weight'].iat[0],
-            'name':     nm
-        })
+            'name':     nm})
     lines_gdf = gpd.GeoDataFrame(
         named_rows, geometry='geometry', crs=pois.crs
     ) if named_rows else gpd.GeoDataFrame(
@@ -1509,7 +2151,7 @@ def get_poi_network(bbox_coords, tags_pesos, vehicular_highways, output_geojson,
     pois = gpd.GeoDataFrame(pois, geometry='geometry', crs=pois.crs)
     pois = pois.reset_index(drop=True)
     pois['poi_id'] = pois.index + 1
-    pois['name'] = pois['name'].fillna('').replace('', 'Sem nome')
+    pois['name'] = pois['name'].fillna('').replace('', 'Unnamed')
     pois[['poi_id','name','type','weight','geometry']].to_file(output_geojson, driver='GeoJSON')
     pois[['poi_id','name','type','weight']].to_excel(output_excel, index=False)
     print("✅ POIs extraídos com sucesso")
@@ -1625,7 +2267,7 @@ def visualizar_pois(pois_gdf, bbox_coords, output_path):
     gl = ax.gridlines(draw_labels=True, linewidth=0.5, linestyle='--', color='gray')
     gl.top_labels = False
     gl.right_labels = False
-    legend = [Patch(color='blue', label='POIs regulares'), Patch(color='red',  label='POIs críticos')]
+    legend = [Patch(color='blue', label='Regular POIs'), Patch(color='red',  label='Critical POIs')]
     ax.legend(handles=legend, loc='lower left')
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
@@ -1697,8 +2339,7 @@ def visualizar_setores(df, bbox_coords, output_path):
     osm_tiles = cimgt.OSM()
     fig = plt.figure(figsize=(12,10))
     ax = plt.axes(projection=osm_tiles.crs)
-    ax.set_extent([sw_lng, ne_lng, sw_lat, ne_lat],
-                  crs=ccrs.PlateCarree())
+    ax.set_extent([sw_lng, ne_lng, sw_lat, ne_lat], crs=ccrs.PlateCarree())
     try:
         ax.add_image(osm_tiles, zoom, alpha=0.5)
     except URLError:
@@ -1709,8 +2350,10 @@ def visualizar_setores(df, bbox_coords, output_path):
     for m in munis:
         subset = df[df['NM_MUNICIP'] == m]
         subset.plot(ax=ax, facecolor=color_map[m], edgecolor='white', linewidth=1.5, transform=ccrs.PlateCarree())
+
     def relative_pos(x, y):
         return ((x - sw_lng) / (ne_lng - sw_lng), (y - sw_lat) / (ne_lat - sw_lat))
+
     base_dx, base_dy = 50, 30
     for m in munis:
         subset = df[df['NM_MUNICIP'] == m]
@@ -1755,9 +2398,7 @@ def compute_zeta_index(census_gdf, roads_gdf, road_raster_path, dem_path, rho_ex
     print("\n⚙️ Iniciando cálculo do índice composto ζ...")
     w_pd, w_road, w_rho, w_ec = weights
     rho_df = pd.read_excel(rho_excel, dtype={'CD_GEOCODI': str})
-    census = census_gdf.merge(
-        rho_df[['CD_GEOCODI', 'rho_prime']],
-        on='CD_GEOCODI', how='left')
+    census = census_gdf.merge(rho_df[['CD_GEOCODI', 'rho_prime']], on='CD_GEOCODI', how='left')
     crs, transform, width, height = _load_dem_meta(dem_path)
     print(f"🌐 Usando CRS do DEM reprojetado: {crs}")
     census_utm = census.to_crs(crs)
@@ -1824,10 +2465,7 @@ def compute_social_elasticity_index(sectors_gdf, census_gdf, output_gpkg, output
     census_full['state'] = census_full['CD_GEOCODI'].str[:2]
     census_full['cv_raw'] = census_full['Variancia'] / census_full['Renda'].replace({0: np.nan})
     census_full['cv_pct'] = census_full.groupby(['state','TIPO'])['cv_raw'].rank(pct=True).fillna(0)
-    gdf = sectors_gdf.merge(
-        census_full[['CD_GEOCODI','cv_raw','cv_pct']],
-        on='CD_GEOCODI',
-        how='left')
+    gdf = sectors_gdf.merge( census_full[['CD_GEOCODI','cv_raw','cv_pct']], on='CD_GEOCODI', how='left')
     gdf['pop_5mais'] = (gdf['Residentes'] - gdf['Criancas_0a4']).clip(lower=0)
     gdf['illiteracy_rate'] = 1 - (gdf['Alfabetizados'] / gdf['pop_5mais'].replace({0: np.nan}))
     gdf['gamma'] = (gdf['cv_pct'] * gdf['illiteracy_rate']).fillna(0).round(4)
@@ -1857,8 +2495,19 @@ def clean_sector_outputs(gpkg_path, excel_path):
 def compute_critical_interdependence_index(susc_raster_path, pois_geojson_path):
     print("\n⚙️ Iniciando cálculo do Critical Interdependence Index (θ)...")
     pois = gpd.read_file(pois_geojson_path)
-    total_assets = len(pois)
-    total_weight = pois['weight'].sum()
+
+    def _to_float_series(s):
+        s = s.astype(str).str.strip()
+        s = s.str.replace('−', '-', regex=False).str.replace(',', '.', regex=False)
+        s = s.str.replace(r'[^0-9\.\-]+', '', regex=True)
+        return pd.to_numeric(s, errors='coerce').astype('float64').fillna(0.0)
+
+    if 'weight' not in pois.columns:
+        pois['weight'] = 1.0
+    else:
+        pois['weight'] = _to_float_series(pois['weight'])
+    total_assets = int(len(pois))
+    total_weight = float(pois['weight'].sum())
     print(f"🔢 Total de ativos: {total_assets}")
     print(f"🔣 Soma de pesos total: {total_weight:.0f}")
     log(info, f"Total POIs in the region: {total_assets}")
@@ -1871,16 +2520,13 @@ def compute_critical_interdependence_index(susc_raster_path, pois_geojson_path):
     susc_values = []
     for geom in pois.geometry:
         mask = rasterio.features.geometry_mask(
-            [mapping(geom)],
-            invert=True,
-            transform=transform,
-            out_shape=arr.shape)
+            [mapping(geom)], invert=True, transform=transform, out_shape=arr.shape)
         vals = arr[mask]
         susc_values.append(int(vals.max()) if vals.size else np.nan)
     pois['susc'] = susc_values
-    crit = pois.loc[(pois['weight'] > 3) & (pois['susc'] == 5)]
-    num_crit = len(crit)
-    sum_crit = crit['weight'].sum()
+    crit = pois.loc[(pois['weight'] > 3.0) & (pois['susc'] == 5)]
+    num_crit = int(len(crit))
+    sum_crit = float(crit['weight'].sum())
     theta = float(sum_crit / total_weight) if total_weight > 0 else 0.0
     print(f"🔢 Ativos críticos em muito alta suscetibilidade: {num_crit}")
     print(f"🔣 Soma de pesos críticos: {sum_crit:.0f}")
@@ -1927,7 +2573,7 @@ def compute_svci(sectors_gdf, burn_raster_path, output_raster_path, theta, k, la
         dst.set_band_description(4, "rho_prime")
         dst.set_band_description(5, "EC_prime")
         dst.set_band_description(6, "zeta")
-        dst.set_band_description(7, "interpolado_flag")
+        dst.set_band_description(7, "interpolated_flag")
         dst.set_band_description(8, "gamma")
         dst.set_band_description(9, "sigma_zeta")
         dst.set_band_description(10, "mu")
@@ -1939,15 +2585,46 @@ def compute_svci(sectors_gdf, burn_raster_path, output_raster_path, theta, k, la
     return burn_id, vulner, profile
 
 
-def compute_risk(burn_id, vulner, prev, base_profile, output_path):
+def _align_to_profile(src_arr, src_prof, dst_prof, *, is_class=True):
+    if src_prof is None:
+        raise ValueError("Profile de origem requerido para alinhar raster.")
+    dst = np.full((dst_prof['height'], dst_prof['width']), np.nan, dtype=np.float32)
+    reproject(
+        source=src_arr.astype(np.float32),
+        destination=dst,
+        src_transform=src_prof['transform'],
+        src_crs=src_prof['crs'],
+        dst_transform=dst_prof['transform'],
+        dst_crs=dst_prof['crs'],
+        src_nodata=src_prof.get('nodata', None),
+        dst_nodata=np.nan,
+        resampling=Resampling.nearest if is_class else Resampling.bilinear)
+    return dst
+
+
+def compute_risk(burn_id, vulner, prev, base_profile, output_path, *, burn_profile=None, vulner_profile=None):
     print("\n⚙️ Calculando o risco da infraestrutura viária...")
+    H, W = base_profile['height'], base_profile['width']
+    if burn_id.shape != (H, W):
+        burn_id = _align_to_profile(burn_id, burn_profile, base_profile, is_class=True)
+    if vulner.shape != (H, W):
+        vulner = _align_to_profile(vulner, vulner_profile, base_profile, is_class=True)
     if not (burn_id.shape == vulner.shape == prev.shape):
         raise ValueError("Todos os arrays devem ter o mesmo shape.")
+    print("shapes -> burn:", burn_id.shape, "vulner:", vulner.shape, "prev:", prev.shape)
+    if not (burn_id.shape == vulner.shape == prev.shape):
+        raise ValueError(
+            f"Todos os arrays devem ter o mesmo shape. "
+            f"burn={burn_id.shape}, vulner={vulner.shape}, prev={prev.shape}")
     nodata = -9999
     mask = (burn_id != 0)
     burn_f = burn_id.astype(np.float32)
     vuln_f = vulner.astype(np.float32)
     susc_f = prev.astype(np.float32)
+    if np.issubdtype(prev.dtype, np.integer):
+        susc_f[prev == 255] = np.nan
+    if np.issubdtype(vulner.dtype, np.integer):
+        vuln_f[vulner == 255] = np.nan
     burn_f[~mask] = nodata
     vuln_f[~mask] = nodata
     susc_f[~mask] = nodata
@@ -1968,9 +2645,9 @@ def compute_risk(burn_id, vulner, prev, base_profile, output_path):
     with rasterio.open(output_path, 'w', **profile) as dst:
         dst.write(bands)
         dst.set_band_description(1, "burn_id")
-        dst.set_band_description(2, "vulnerabilidade")
-        dst.set_band_description(3, "suscetibilidade")
-        dst.set_band_description(4, "risco")
+        dst.set_band_description(2, "vulnerability")
+        dst.set_band_description(3, "susceptibility")
+        dst.set_band_description(4, "risk")
     print("✅ Risco calculado com sucesso")
     log(pasta, f"File: {output_path} — Final raster map with flood risk to road infrastructure")
 
@@ -1982,16 +2659,16 @@ def visualizar_risco(risk_raster_path, bbox_coords, output_path):
     lon_diff = ne_lng - sw_lng
     max_diff = max(lat_diff, lon_diff)
     if max_diff < 0.005: zoom = 17
-    elif max_diff < 0.01:  zoom = 16
-    elif max_diff < 0.02:  zoom = 15
-    elif max_diff < 0.05:  zoom = 14
-    elif max_diff < 0.1:   zoom = 13
-    elif max_diff < 0.5:   zoom = 12
-    elif max_diff < 1.0:   zoom = 11
-    elif max_diff < 2.0:   zoom = 10
-    elif max_diff < 5.0:   zoom = 9
-    elif max_diff < 10.0:  zoom = 8
-    else:                  zoom = 6
+    elif max_diff < 0.01: zoom = 16
+    elif max_diff < 0.02: zoom = 15
+    elif max_diff < 0.05: zoom = 14
+    elif max_diff < 0.1: zoom = 13
+    elif max_diff < 0.5: zoom = 12
+    elif max_diff < 1.0: zoom = 11
+    elif max_diff < 2.0: zoom = 10
+    elif max_diff < 5.0: zoom = 9
+    elif max_diff < 10.0: zoom = 8
+    else: zoom = 6
     with rasterio.open(risk_raster_path) as src:
         risk = src.read(4).astype(np.int32)
         transform = src.transform
@@ -2009,8 +2686,7 @@ def visualizar_risco(risk_raster_path, bbox_coords, output_path):
     osm_tiles = cimgt.OSM()
     fig = plt.figure(figsize=(12, 10))
     ax = plt.axes(projection=osm_tiles.crs)
-    ax.set_extent([sw_lng, ne_lng, sw_lat, ne_lat],
-                  crs=ccrs.PlateCarree())
+    ax.set_extent([sw_lng, ne_lng, sw_lat, ne_lat], crs=ccrs.PlateCarree())
     try:
         ax.add_image(osm_tiles, zoom, alpha=0.5)
     except URLError:
@@ -2023,11 +2699,11 @@ def visualizar_risco(risk_raster_path, bbox_coords, output_path):
         4: '#FF8C00',
         5: '#8B0000',}
     labels = {
-        1: 'Muito Baixo',
-        2: 'Baixo',
-        3: 'Moderado',
-        4: 'Alto',
-        5: 'Muito Alto',}
+        1: 'Very Low',
+        2: 'Low',
+        3: 'Moderate',
+        4: 'High',
+        5: 'Very High',}
     for lvl in levels:
         mask = (risk == lvl)
         if not mask.any():
@@ -2046,7 +2722,7 @@ def visualizar_risco(risk_raster_path, bbox_coords, output_path):
     legend_elems = [
         Line2D([0],[0], color=colors[l], lw=2, label=f'Risco {labels[l]}')
         for l in levels if (risk == l).any()]
-    ax.legend(handles=legend_elems, loc='lower left', title='Níveis de Risco')
+    ax.legend(handles=legend_elems, loc='lower left', title='Risk Levels')
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
@@ -2073,7 +2749,7 @@ def top10_rodovias(risk_raster_path, path_inforoads, output_excel=None):
     cnt_sorted = cnt.sort_values(by=['c5', 'c4', 'c3', 'c2', 'c1'], ascending=False)
     roads = pd.read_excel(path_inforoads, dtype={'burn_id': int})
     roads = roads.set_index('burn_id')['name']
-    texto = {5: 'Muito Alto', 4: 'Alto', 3: 'Moderado', 2: 'Baixo', 1: 'Muito Baixo'}
+    texto = {5: 'Very High', 4: 'High', 3: 'Moderate', 2: 'Low', 1: 'Very Low'}
     result = []
     result_ids = []
     seen = set()
@@ -2112,16 +2788,16 @@ def visualizar_top10(risk_raster_path, path_top10, bbox_coords, output_path):
     lat_diff, lon_diff = ne_lat - sw_lat, ne_lng - sw_lng
     max_diff = max(lat_diff, lon_diff)
     if   max_diff < 0.005: zoom = 17
-    elif max_diff < 0.01:  zoom = 16
-    elif max_diff < 0.02:  zoom = 15
-    elif max_diff < 0.05:  zoom = 14
-    elif max_diff < 0.1:   zoom = 13
-    elif max_diff < 0.5:   zoom = 12
-    elif max_diff < 1.0:   zoom = 11
-    elif max_diff < 2.0:   zoom = 10
-    elif max_diff < 5.0:   zoom = 9
-    elif max_diff < 10.0:  zoom = 8
-    else:                  zoom = 6
+    elif max_diff < 0.01: zoom = 16
+    elif max_diff < 0.02: zoom = 15
+    elif max_diff < 0.05: zoom = 14
+    elif max_diff < 0.1: zoom = 13
+    elif max_diff < 0.5: zoom = 12
+    elif max_diff < 1.0: zoom = 11
+    elif max_diff < 2.0: zoom = 10
+    elif max_diff < 5.0: zoom = 9
+    elif max_diff < 10.0: zoom = 8
+    else: zoom = 6
     with rasterio.open(risk_raster_path) as src:
         burn_id = src.read(1).astype(int)
         risk = src.read(4).astype(int)
@@ -2135,11 +2811,11 @@ def visualizar_top10(risk_raster_path, path_top10, bbox_coords, output_path):
     df_top10 = pd.read_excel(path_top10, dtype={'Burn_ID': int})
     df_top10 = df_top10.sort_values('Position')
     label_to_color = {
-        'Muito Baixo': '#006400',
-        'Baixo':       '#7CFC00',
-        'Moderado':    '#FFD700',
-        'Alto':        '#FF8C00',
-        'Muito Alto':  '#8B0000',}
+        'Very Low': '#006400',
+        'Low':       '#7CFC00',
+        'Moderate':    '#FFD700',
+        'High':        '#FF8C00',
+        'Very High':  '#8B0000',}
     osm_tiles = cimgt.OSM()
     fig = plt.figure(figsize=(12,10))
     ax = plt.axes(projection=osm_tiles.crs)
@@ -2206,6 +2882,26 @@ def visualizar_top10(risk_raster_path, path_top10, bbox_coords, output_path):
     log(check, "Risk analysis completed successfully!", color="black", font_size=14, font_weight="bold", icon_size=14)
 
 
+def _finalize_and_cleanup(total_segundos):
+    if total_segundos < 60:
+        log_spacing(f"Elapsed time: {total_segundos} seconds")
+    elif total_segundos < 3600:
+        minutos = total_segundos // 60
+        segundos = total_segundos % 60
+        log_spacing(f"Elapsed time: {minutos} min {segundos} s")
+    else:
+        horas = total_segundos // 3600
+        minutos = (total_segundos % 3600) // 60
+        log_spacing(f"Elapsed time: {horas} h {minutos} min")
+    log_spacing()
+    log(check, "Risk analysis completed successfully!", color="black", font_size=14, font_weight="bold", icon_size=14)
+    del_pasta("cache")
+    del_file("dem_tmp.tif")
+    del_file("Flow_accumulation_withnodata.tif")
+    del_file(path_geohydro)
+    del_file(path_georoads)
+
+
 def run_start():
     # Inicializar o Earth Engine
     initialize_ee()
@@ -2219,15 +2915,20 @@ def run_start():
     ICON_FILE = os.path.join(base_dir, "Icons", "logo_ico.ico")
     api = Api()
     webview.create_window("Select the region of interest", html=open("Database/map.html", "r").read(), width=1180, height=720, js_api=api)
-    webview.start(gui='qt', icon=ICON_FILE)
+    webview.start(gui='edgechromium', icon=ICON_FILE, debug=False)
     north_east_lat, north_east_lng, south_west_lat, south_west_lng = coordinates()
+
+    global RUN_MODE
+    RUN_MODE = prompt_module_choice()
 
     # Iniciar o PRIORI
     mostrar_tela_logs(north_east_lat, north_east_lng, south_west_lat, south_west_lng)
 
 
-def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng):
+def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng, run_mode="full"):
     bbox = (south_west_lng, south_west_lat, north_east_lng, north_east_lat)
+
+    ensure_models()
 
     # Obter o DEM
     get_copernicus_dem(
@@ -2238,7 +2939,7 @@ def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng):
         output_dem=path_dem)
 
     # Reprojetar o DEM e calcular o fluxo acumulado
-    flow_accum_path = calculate_flow_accumulation(
+    calculate_flow_accumulation(
         dem_path=path_dem,
         filled_dem=path_filled,
         flow_path=path_d8,
@@ -2271,42 +2972,34 @@ def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng):
     calculate_HAND(
         filled_path=path_filled,
         drainage_path=path_drai,
-        output_path=path_handraw)
+        output_path=path_handraw,
+        bbox_ext=bbox)
     calcular_mrvbf(
         dem_path=path_dem,
-        output_path=path_mrvbfraw)
-
-    # Reclassificação de variáveis
-    reclassificar_hand(
-        input_path=path_handraw,
-        output_path=path_handclass)
-    reclassificar_mrvbf(
-        input_path=path_mrvbfraw,
-        output_path=path_mrvbfclass)
+        output_path=path_mrvbfraw,
+        bbox_ext=bbox)
 
     # Cálculo suscetibilidade
-    calcular_indice_ahp(
-        input_path_1=path_handclass,
-        input_path_2=path_mrvbfclass,
-        output_path=path_ahp,
-        peso_hand=0.5,
-        peso_mrvbf=0.5)
-    reclassificar_indice_ahp(
-        input_path=path_ahp,
-        output_path=path_susclass)
-    prev = smooth_recursive(
-        input_path=path_susclass,
-        output_path=path_susc,
-        mode_window=5,
-        selem_radius=2,
-        min_size_pixels=500,
-        max_iters=10,
-        tol_change=0)
+    prev = calculate_susceptibility(
+        path_handraw=path_handraw,
+        path_mrvbfraw=path_mrvbfraw,
+        path_rivermask=path_hydro,
+        path_rfmodel=path_rfmodel,
+        path_susc=path_susc,
+        BUFFER_M=max_chunk_suscept,
+        MRVBF_HIGH_LEVEL=mrvbf_plain_level,
+        CHUNK_PRED=river_buffer_suscept)
     visualizar_suscetibilidade(
         susc_path_=path_susc,
         rios_path_=path_hydro,
         vias_path_=path_rasroads,
         output_path_=path_susimg)
+
+    # Verificar run mode
+    if run_mode == "susc_only":
+        total_segundos = int((datetime.now() - time_start).total_seconds()) if time_start else 0
+        _finalize_and_cleanup(total_segundos)
+        return
 
     # Extrair Pontos de Interesse
     pois = get_poi_network(
@@ -2390,12 +3083,16 @@ def run_priori(north_east_lat, north_east_lng, south_west_lat, south_west_lng):
         phi=0.2)
 
     # Cálculo do risco
+    with rasterio.open(path_susc) as src_susc:
+        susc_profile = src_susc.profile.copy()
     compute_risk(
         burn_id=burn_id,
         vulner=vulner,
         prev=prev,
-        base_profile=profile,
-        output_path=path_risk)
+        base_profile=susc_profile,
+        output_path=path_risk,
+        burn_profile=profile,
+        vulner_profile=profile)
 
     # Imagem do risco:
     visualizar_risco(
@@ -2446,16 +3143,12 @@ if __name__ == "__main__":
     path_rasroads = "Resultados/roads.tif"                  # Raster contendo os ids da malha viária
     path_inforoads = "Resultados/roads_info.xlsx"           # ID, nome, tipo, peso
     path_handraw = "Resultados/hand_raw.tif"                # HAND conforme metodologia original
-    path_handclass = "Resultados/hand_class.tif"            # HAND reclassificado de 1 a 5
     path_mrvbfraw = "Resultados/mrvbf_raw.tif"              # MRVBF conforme metodologia original
-    path_mrvbfclass = "Resultados/mrvbf_class.tif"          # MRVBF reclassificado de 1 a 5
-    path_ahp = "Resultados/susceptibility_ahp.tif"          # Combinação AHP do HAND e MRVBF contínua
-    path_susclass = "Resultados/susceptibility_class.tif"   # Suscetibilidade reclassificada de 1 a 5
     path_susc = "Resultados/susceptibility.tif"             # Arquivo final da suscetibilidade com suavização
     path_susimg = "Resultados/susceptibility.png"           # Imagem da suscetibilidade da região
     path_geopoi = "Resultados/pois.geojson"                 # Geojson com localização da infraestrutura funcional
     path_xlsxpoi = "Resultados/pois_info.xlsx"              # ID, nome, tipo, peso
-    path_census = "Database/BR_Census.gpkg"  # Base de dados IBGE 2010
+    path_census = "Database/BR_Census.gpkg"                 # Base de dados IBGE 2010
     path_sectors = "Resultados/sectors.gpkg"                # Setores e metadados completos
     path_xlsxsec = "Resultados/sectors_info.xlsx"           # Identificação, variáveis IBGE e parâmetros calculados
     path_zeta = "Resultados/zeta_tmp.tif"                   # Cálculo da variável Zeta para as rodovias
@@ -2466,8 +3159,13 @@ if __name__ == "__main__":
     path_risk_img = "Resultados/risk_map.png"               # Imagem: visualização do risco nas rodovias
     path_top10 = "Resultados/top_10.xlsx"                   # Tabela com top 10 das rodovias com maior risco
     path_top10_img = "Resultados/top_10.png"                # Imagem: top 10 das rodovias com maior risco
+    path_rfmodel = "Database"                               # Pasta: artefatos do modelo random forest
 
     # Parâmetros ajustáveis
+    max_chunk_suscept = 300_000
+    mrvbf_plain_level = 6.0
+    river_buffer_suscept = 100
+
     vuln_weights = {
         'motorway': 5,
         'trunk': 5,
