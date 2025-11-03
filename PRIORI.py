@@ -1716,123 +1716,7 @@ def calcular_mrvbf(dem_path, output_path, wmax_px=243, bbox_ext=None):
         "clipped": bbox_ext is not None}
     return mrvbf_out, meta
 
-
-def calculate_susceptibility(path_handraw, path_mrvbfraw, path_rivermask, path_rfmodel, path_susc, BUFFER_M, MRVBF_HIGH_LEVEL, CHUNK_PRED, K=5):
-    if "LOKY_MAX_CPU_COUNT" not in os.environ:
-        try:
-            import psutil
-            n_phys = psutil.cpu_count(logical=False) or os.cpu_count() or 1
-        except Exception:
-            n_phys = os.cpu_count() or 1
-        os.environ["LOKY_MAX_CPU_COUNT"] = str(n_phys)
-    warnings.filterwarnings("ignore", category=UserWarning, module=r"joblib\.externals\.loky\.backend\.context")
-    warnings.filterwarnings("ignore", category=UserWarning, module=r".*loky\.backend\.context$")
-
-    def _safe_phys_tuple():
-        try:
-            n = int(os.environ.get("LOKY_MAX_CPU_COUNT", ""))
-            if n <= 0:
-                raise ValueError
-            return n, None
-        except Exception as e:
-            return (os.cpu_count() or 1), e
-
-    for modname in ("joblib.externals.loky.backend.context", "loky.backend.context"):
-        ctx = sys.modules.get(modname)
-        if ctx:
-            try:
-                setattr(ctx, "_count_physical_cores", _safe_phys_tuple)
-                setattr(ctx, "_count_physical_cores_win32", _safe_phys_tuple)
-            except Exception:
-                pass
-
-    def _cpu_count_public(only_physical_cores=False):
-        if only_physical_cores:
-            return _safe_phys_tuple()[0]
-        return os.cpu_count() or _safe_phys_tuple()[0]
-
-    for pkgname in ("joblib.externals.loky", "loky"):
-        pkg = sys.modules.get(pkgname)
-        if pkg:
-            try:
-                setattr(pkg, "cpu_count", _cpu_count_public)
-            except Exception:
-                pass
-    spinner = log_loading(loading, "Processing susceptibility...")
-
-    def read_raster(path):
-        ds = rasterio.open(path)
-        arr = ds.read(1)
-        prof = ds.profile.copy()
-        return ds, arr, prof
-
-    def reproject_match(src_arr, src_prof, dst_prof, resampling=Resampling.bilinear):
-        dst = np.full((dst_prof['height'], dst_prof['width']), np.nan, dtype=np.float32)
-        reproject(
-            source=src_arr.astype(np.float32),
-            destination=dst,
-            src_transform=src_prof['transform'],
-            src_crs=src_prof['crs'],
-            dst_transform=dst_prof['transform'],
-            dst_crs=dst_prof['crs'],
-            src_nodata=src_prof.get('nodata', None),
-            dst_nodata=np.nan,
-            resampling=resampling)
-        return dst
-
-    def pixel_size_m(transform):
-        px = abs(transform.a)
-        py = abs(transform.e)
-        return float((px + py) / 2.0) if px > 0 and py > 0 else 1.0
-
-    def build_river_masks(river_path, ref_shape, ref_transform, ref_crs, buffer_m):
-        from shapely.geometry import shape as shp_shape
-        from shapely.ops import unary_union
-        import geopandas as gpd
-
-        def _geom_to_mask(geom, buf_m):
-            if geom is None: return np.zeros(ref_shape, dtype=bool)
-            g = geom.buffer(buf_m) if buf_m != 0 else geom
-            if g.is_empty: return np.zeros(ref_shape, dtype=bool)
-            mk = rasterize([(g, 1)], out_shape=ref_shape, transform=ref_transform, fill=0, dtype='uint8', all_touched=True)
-            return mk.astype(bool)
-
-        ext = os.path.splitext(river_path.lower())[1]
-        if ext in (".tif", ".tiff"):
-            with rasterio.open(river_path) as src:
-                arr = src.read(1)
-                arr_match = reproject_match(arr, src.profile, {
-                    'transform': ref_transform, 'crs': ref_crs,
-                    'height': ref_shape[0], 'width': ref_shape[1]},
-                    resampling=Resampling.nearest)
-            river_bool = np.isfinite(arr_match) & (arr_match > 0)
-            geoms = []
-            for geom, val in shapes(river_bool.astype(np.uint8), mask=river_bool.astype(np.uint8), transform=ref_transform):
-                if val == 1:
-                    geoms.append(shp_shape(geom))
-            union = unary_union(geoms) if geoms else None
-            core = _geom_to_mask(union, 0.0)
-            buff = _geom_to_mask(union, buffer_m)
-            return core, buff
-        else:
-            gdf = gpd.read_file(river_path)
-            if gdf.empty: return np.zeros(ref_shape, bool), np.zeros(ref_shape, bool)
-            if gdf.crs is None: raise ValueError("Vetor de rios sem CRS.")
-            gdf = gdf.to_crs(ref_crs)
-            union = unary_union(gdf.geometry)
-            core = _geom_to_mask(union, 0.0)
-            buff = _geom_to_mask(union, buffer_m)
-            return core, buff
-
-    def score_signature(score, valid_mask, ps):
-        s = score[valid_mask]
-        s = s[np.isfinite(s)]
-        if s.size == 0:
-            return None
-        qs = np.quantile(s, np.array(ps, dtype=float)/100.0)
-        return qs.astype(float)
-
-    def mix_cuts_by_proto(th_json, K, sig_new, allow_extrapolation=True):
+def mix_cuts_by_proto(th_json, K, sig_new, allow_extrapolation=True):
         proto = th_json.get("proto", None)
         if not proto:
             return None, None, None
@@ -1858,130 +1742,213 @@ def calculate_susceptibility(path_handraw, path_mrvbfraw, path_rivermask, path_r
                 mixed[i] = np.nextafter(mixed[i-1], np.inf)
         return mixed.astype(float), alpha, (k0, k1)
 
-    def compute_features(hand, mrvbf, in_channel_bool, transform):
-        H, W = hand.shape
-        px_m = pixel_size_m(transform)
-        dist_pix = distance_transform_edt(in_channel_bool == 0)
-        dist_m = dist_pix.astype(np.float32) * float(px_m)
-        in_buffer = (dist_m <= float(BUFFER_M)).astype(np.float32)
-        HAND = hand.astype(np.float32, copy=False)
-        MRV = mrvbf.astype(np.float32, copy=False)
-        INCH = in_channel_bool.astype(np.float32, copy=False)
-        DST = dist_m.astype(np.float32, copy=False)
-        T_high = float(MRVBF_HIGH_LEVEL)
-        mrvbf_high = (np.isfinite(MRV) & (MRV >= T_high)).astype(np.float32)
-        k = max(1, int(round(float(BUFFER_M) / max(px_m, 1e-6))) * 2 + 1)
-        plain_frac100 = uniform_filter(mrvbf_high, size=k, mode="nearest")
-        m_buf = MRV[(in_buffer > 0) & np.isfinite(MRV)]
-        ctx_planarity = float(np.mean(m_buf >= T_high)) if m_buf.size > 0 else 0.0
-        ctx_mrvbf_p90 = float(np.percentile(m_buf, 90)) if m_buf.size > 0 else 0.0
-        CTX = np.full_like(HAND, ctx_planarity, dtype=np.float32)
-        CTXp90 = np.full_like(HAND, ctx_mrvbf_p90, dtype=np.float32)
-        HAND_scaled_1 = HAND / (1.0 + 0.75 * plain_frac100 + 1e-6)
-        HAND_scaled_2 = HAND * (1.0 - 0.50 * plain_frac100)
-        HAND_eff = HAND / (1e-3 + plain_frac100)
-        HANDxMRV = HAND * MRV
-        LOG_DST = np.log1p(DST).astype(np.float32)
-        valid_hand = np.isfinite(HAND)
-        if np.any(valid_hand):
-            mu = float(np.nanmean(HAND[valid_hand]))
-            sd = float(np.nanstd(HAND[valid_hand]) + 1e-6)
+
+def _read_river_geoms(river_path, ref_shape, ref_transform, ref_crs):
+    from rasterio.warp import reproject, Resampling
+    from shapely.geometry import shape as shp_shape
+    geoms_out = []
+    ext = os.path.splitext(river_path.lower())[1]
+    if ext in (".tif", ".tiff"):
+        with rasterio.open(river_path) as src:
+            arr = src.read(1)
+            nod = src.nodata
+            if nod is not None:
+                arr = np.where(arr == nod, 0, arr)
+            dst = np.zeros(ref_shape, dtype=np.uint8)
+            reproject(
+                source=(arr > 0).astype(np.uint8),
+                destination=dst,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=ref_transform,
+                dst_crs=ref_crs,
+                src_nodata=0,
+                dst_nodata=0,
+                resampling=Resampling.nearest)
+        mask = dst.astype(np.uint8)
+        for geom, val in shapes(mask, mask=mask, transform=ref_transform):
+            if val == 1:
+                g = shp_shape(geom)
+                if not g.is_empty:
+                    geoms_out.append(g)
+        return geoms_out  # já no ref_crs
+    gdf = gpd.read_file(river_path)
+    if gdf.empty:
+        return []
+    if gdf.crs is None:
+        raise ValueError("Vetor de rios sem CRS.")
+    gdf = gdf.to_crs(ref_crs)
+    for g in gdf.geometry:
+        if g is None or g.is_empty:
+            continue
+        try:
+            if not g.is_valid:
+                g = g.buffer(0)
+        except Exception:
+            pass
+        if g is not None and not g.is_empty:
+            geoms_out.append(g)
+    return geoms_out
+
+
+def calculate_susceptibility(path_handraw, path_mrvbfraw, path_rivermask, path_rfmodel,path_susc, BUFFER_M, MRVBF_HIGH_LEVEL, CHUNK_PRED, K=5):
+    from joblib import load
+    from threadpoolctl import threadpool_limits
+    spinner = log_loading(loading, "Calculating susceptibility...")
+    for var in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+    hds = rasterio.open(path_handraw)
+    H, W = hds.height, hds.width
+    transform, crs = hds.transform, hds.crs
+    hand = hds.read(1).astype(np.float32)
+    if hds.nodata is not None:
+        hand[hand == hds.nodata] = np.nan
+    mds = rasterio.open(path_mrvbfraw)
+    vrt_mrv = rasterio.vrt.WarpedVRT(
+        mds, crs=crs, transform=transform, width=W, height=H,
+        resampling=Resampling.bilinear)
+    mrv = vrt_mrv.read(1).astype(np.float32)
+    nod_mrv = vrt_mrv.nodata if vrt_mrv.nodata is not None else mds.nodata
+    if nod_mrv is not None:
+        mrv = np.where(mrv == nod_mrv, np.nan, mrv)
+    mrv[~np.isfinite(mrv)] = np.nan  # garante NaN
+
+    def _river_core_full():
+        ext = os.path.splitext(path_rivermask.lower())[1]
+        if ext in (".tif", ".tiff"):
+            rsrc = rasterio.open(path_rivermask)
+            vrt_riv = rasterio.vrt.WarpedVRT(
+                rsrc, crs=crs, transform=transform, width=W, height=H,
+                resampling=Resampling.nearest)
+            arr = vrt_riv.read(1)
+            nod = vrt_riv.nodata if vrt_riv.nodata is not None else rsrc.nodata
+            if nod is not None:
+                arr = np.where(arr == nod, 0, arr)
+            core = (arr > 0)
+            vrt_riv.close(); rsrc.close()
+            return core
         else:
-            mu, sd = 0.0, 1.0
-        HAND_z = ((HAND - mu) / sd).astype(np.float32)
-        HAND_rank = np.zeros_like(HAND, dtype=np.float32)
-        if np.any(valid_hand):
-            hs = np.sort(HAND[valid_hand])
-            idx = np.searchsorted(hs, HAND[valid_hand], side="right")
-            HAND_rank[valid_hand] = idx.astype(np.float32) / float(hs.size)
-        feat_dict = {
-            "HAND": HAND,
-            "MRVBF": MRV,
-            "in_channel": INCH,
-            "dist_to_channel_m": DST,
-            "log_dist_m": LOG_DST,
-            "in_buffer": in_buffer,
-            "plain_frac100": plain_frac100,
-            "ctx_planarity": CTX,
-            "ctx_mrvbf_p90": CTXp90,
-            "HAND_scaled_1": HAND_scaled_1,
-            "HAND_scaled_2": HAND_scaled_2,
-            "HANDxMRVBF": HANDxMRV,
-            "HAND_eff": HAND_eff,
-            "HAND_z": HAND_z,
-            "HAND_rank": HAND_rank}
-        return feat_dict
-
-    def predict_in_chunks(model, X, chunk=300_000):
-        n = X.shape[0]
-        out = np.empty(n, dtype=np.float32)
-        s = 0
-        while s < n:
-            e = min(s + chunk, n)
-            out[s:e] = model.predict(X[s:e]).astype(np.float32)
-            s = e
-        return out
-
-    def load_artifacts(model_dir):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            from joblib import load
-            model_path = os.path.join(model_dir, "model_hgbr.joblib")
-            fo_path = os.path.join(model_dir, "feature_order.json")
-            cfg_path = os.path.join(model_dir, "config.json")
-            th_path = os.path.join(model_dir, "score_thresholds.json")
-            if not os.path.isfile(model_path): sys.exit("model_hgbr.joblib não encontrado.")
-            if not os.path.isfile(fo_path): sys.exit("feature_order.json não encontrado.")
-            if not os.path.isfile(th_path): sys.exit("score_thresholds.json não encontrado.")
-            model = load(model_path)
-        with open(fo_path, "r", encoding="utf-8") as f:
-            foj = json.load(f)
-        feat_names = foj.get("feature_names")
-        if not feat_names: sys.exit("feature_names ausente em feature_order.json.")
-        with open(th_path, "r", encoding="utf-8") as f:
-            thresholds = json.load(f)
-        cfg = {}
-        if os.path.isfile(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        return model, feat_names, thresholds, cfg
-
-    os.makedirs(os.path.dirname(path_susc) or ".", exist_ok=True)
-    hds, hand_arr, hprof = read_raster(path_handraw)
-    transform = hprof['transform']; crs = hprof['crs']
-    shape = (hprof['height'], hprof['width'])
-    hand = hand_arr.astype(np.float32)
-    if hprof.get('nodata') is not None:
-        hand[hand == hprof['nodata']] = np.nan
-    mds, mrvbf_arr, mprof = read_raster(path_mrvbfraw)
-    mrvbf = reproject_match(mrvbf_arr, mprof, hprof, resampling=Resampling.bilinear)
-    print("\n⚙️ Calculando suscetibilidade...")
-    river_core, river_buff = build_river_masks(path_rivermask, shape, transform, crs, buffer_m=BUFFER_M)
-    model, feat_order, thresholds_json, cfg = load_artifacts(path_rfmodel)
-    in_channel_bool = river_core.astype(bool)
-    feats = compute_features(hand, mrvbf, in_channel_bool, transform)
-    valid = np.isfinite(hand) & np.isfinite(mrvbf)
-    X = np.column_stack([feats[name][valid] for name in feat_order]).astype(np.float32, copy=False)
-    score = np.full(shape, np.nan, dtype=np.float32)
-    yhat = predict_in_chunks(model, X, chunk=CHUNK_PRED)
-    score[valid] = yhat
-    cuts = None
-    alpha = None
-    proto_keys = None
+            gdf = gpd.read_file(path_rivermask)
+            if gdf.empty:
+                return np.zeros((H, W), dtype=bool)
+            if gdf.crs is None:
+                raise ValueError("Vetor de rios sem CRS.")
+            gdf = gdf.to_crs(crs)
+            union = unary_union(gdf.geometry)
+            if union is None or union.is_empty:
+                return np.zeros((H, W), dtype=bool)
+            mk = rasterize(
+                [(union, 1)], out_shape=(H, W), transform=transform,
+                fill=0, dtype="uint8", all_touched=True)
+            return mk.astype(bool)
+    river_core = _river_core_full()
+    valid = np.isfinite(hand) & np.isfinite(mrv)
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid == 0:
+        vrt_mrv.close(); mds.close(); hds.close()
+        raise RuntimeError("Sem píxeis válidos (verifique overlap/CRS/NoData dos rasters).")
+    model = load(os.path.join(path_rfmodel, "model_hgbr.joblib"))
+    feat_order = json.load(open(os.path.join(path_rfmodel, "feature_order.json"), "r", encoding="utf-8"))["feature_names"]
+    thresholds_json = json.load(open(os.path.join(path_rfmodel, "score_thresholds.json"), "r", encoding="utf-8"))
     ps = thresholds_json["proto"]["signature"]["p"]
-    sig_new = score_signature(score, valid, ps)
+
+    def _px_m(tr):
+        return float((abs(tr.a) + abs(tr.e))/2.0)
+    px_m = _px_m(transform)
+
+    dist_pix = distance_transform_edt(~river_core)
+    max_pix = int(np.ceil(BUFFER_M / max(px_m, 1e-6))) + 1
+    dist_pix = np.minimum(dist_pix, max_pix).astype(np.float32)
+    dist_m = dist_pix * px_m
+    log_dst = np.log1p(dist_m).astype(np.float32)
+    in_buffer = (dist_m <= float(BUFFER_M)).astype(np.float32)
+    k = max(1, int(round(float(BUFFER_M) / max(px_m, 1e-6))) * 2 + 1)
+    mrv_high = (np.isfinite(mrv) & (mrv >= float(MRVBF_HIGH_LEVEL))).astype(np.float32)
+    plain_frac100 = uniform_filter(mrv_high, size=k, mode="nearest")
+    m_buf = mrv[(in_buffer > 0) & np.isfinite(mrv)]
+    ctx_planarity = float(np.mean(m_buf >= float(MRVBF_HIGH_LEVEL))) if m_buf.size else 0.0
+    ctx_mrvbf_p90 = float(np.percentile(m_buf, 90)) if m_buf.size else 0.0
+    need = set(feat_order)
+    mu_hand = sd_hand = None
+    hand_z = None
+    hand_rank = None
+    if "HAND_z" in need:
+        hv = hand[np.isfinite(hand)]
+        mu_hand = float(np.nanmean(hv)) if hv.size else 0.0
+        sd_hand = float(np.nanstd(hv) + 1e-6) if hv.size else 1.0
+        hand_z = ((hand - mu_hand) / sd_hand).astype(np.float32)
+    if "HAND_rank" in need:
+        hv = hand[np.isfinite(hand)]
+        if hv.size:
+            hs = np.sort(hv)
+            idx_valid = np.searchsorted(hs, hand[np.isfinite(hand)], side="right").astype(np.float32)
+            hand_rank = np.zeros_like(hand, dtype=np.float32)
+            hand_rank[np.isfinite(hand)] = idx_valid / float(hs.size)
+        else:
+            hand_rank = np.zeros_like(hand, dtype=np.float32)
+    feat_arrays = {}
+    if "HAND" in need: feat_arrays["HAND"] = hand
+    if "MRVBF" in need: feat_arrays["MRVBF"] = mrv
+    if "in_channel" in need: feat_arrays["in_channel"] = river_core.astype(np.float32)
+    if "dist_to_channel_m" in need: feat_arrays["dist_to_channel_m"] = dist_m
+    if "log_dist_m" in need: feat_arrays["log_dist_m"] = log_dst
+    if "in_buffer" in need: feat_arrays["in_buffer"] = in_buffer
+    if "plain_frac100" in need: feat_arrays["plain_frac100"] = plain_frac100
+    if "HAND_scaled_1" in need:
+        feat_arrays["HAND_scaled_1"] = hand / (1.0 + 0.75*plain_frac100 + 1e-6)
+    if "HAND_scaled_2" in need:
+        feat_arrays["HAND_scaled_2"] = hand * (1.0 - 0.50*plain_frac100)
+    if "HAND_eff" in need:
+        feat_arrays["HAND_eff"] = hand / (1e-3 + plain_frac100)
+    if "HANDxMRVBF" in need:
+        feat_arrays["HANDxMRVBF"] = hand * mrv
+    if "HAND_z" in need:
+        feat_arrays["HAND_z"] = hand_z
+    if "HAND_rank" in need:
+        feat_arrays["HAND_rank"] = hand_rank
+    score = np.full((H, W), np.nan, dtype=np.float32)
+    idx_all = np.flatnonzero(valid.ravel())
+
+    def _build_X_chunk(idxs_flat):
+        cols = []
+        for name in feat_order:
+            if name == "ctx_planarity":
+                cols.append(np.full(idxs_flat.size, ctx_planarity, np.float32))
+            elif name == "ctx_mrvbf_p90":
+                cols.append(np.full(idxs_flat.size, ctx_mrvbf_p90, np.float32))
+            else:
+                col = feat_arrays[name].ravel()[idxs_flat].astype(np.float32, copy=False)
+                cols.append(col)
+        return np.column_stack(cols).astype(np.float32, copy=False)
+
+    with threadpool_limits(limits=1, user_api="blas"), \
+         threadpool_limits(limits=1, user_api="openmp"):
+        s = 0
+        while s < idx_all.size:
+            e = min(s + CHUNK_PRED, idx_all.size)
+            sel = idx_all[s:e]
+            Xb = _build_X_chunk(sel)
+            yb = model.predict(Xb).astype(np.float32, copy=False)
+            score.ravel()[sel] = yb
+            s = e
+    sv = score[valid]
+    if sv.size == 0:
+        vrt_mrv.close(); mds.close(); hds.close()
+        raise RuntimeError("Score sem válidos após predição.")
+    sig_new = np.quantile(sv, np.array(ps, dtype=float)/100.0).astype(float)
     cuts, alpha, proto_keys = mix_cuts_by_proto(thresholds_json, K, sig_new, allow_extrapolation=True)
     if cuts is None:
+        vrt_mrv.close(); mds.close(); hds.close()
         raise RuntimeError("Cortes 'proto' indisponíveis em score_thresholds.json.")
-    out_z = np.full(shape, 255, dtype=np.uint8)
-    if np.any(valid):
-        z = np.digitize(score[valid], cuts) + 1
-        z = (K + 1) - z
-        z = np.clip(z, 1, K).astype(np.uint8)
-        out_z[valid] = z
-    out_z[river_core & np.isfinite(hand) & np.isfinite(mrvbf)] = K
-    out_profile = hprof.copy()
+    out_z = np.full((H, W), 255, dtype=np.uint8)
+    z = np.digitize(sv, cuts) + 1
+    z = (K + 1) - z
+    z = np.clip(z, 1, K).astype(np.uint8)
+    out_z[valid] = z
+    out_z[river_core & valid] = K
+    out_profile = hds.profile.copy()
     out_profile.update(dtype=rasterio.uint8, count=1, nodata=255, compress="deflate")
+    os.makedirs(os.path.dirname(path_susc) or ".", exist_ok=True)
     with rasterio.open(path_susc, "w", **out_profile) as dst:
         dst.write(out_z, 1)
         dst.update_tags(
@@ -1994,9 +1961,8 @@ def calculate_susceptibility(path_handraw, path_mrvbfraw, path_rivermask, path_r
             LABEL_ORIENTATION="1=least_critical;K=most_critical",
             PROTO_KEYS=(json.dumps(proto_keys) if proto_keys else ""),
             PROTO_ALPHA=(f"{alpha:.6f}" if alpha is not None else ""))
+    vrt_mrv.close(); mds.close(); hds.close()
     spinner()
-    log(pasta, f"File: {path_susc} — Susceptibility file")
-    print("✅ Suscetibilidade calculada com sucesso")
     return out_z
 
 
@@ -2524,7 +2490,7 @@ def compute_critical_interdependence_index(susc_raster_path, pois_geojson_path):
         vals = arr[mask]
         susc_values.append(int(vals.max()) if vals.size else np.nan)
     pois['susc'] = susc_values
-    crit = pois.loc[(pois['weight'] > 3.0) & (pois['susc'] == 5)]
+    crit = pois.loc[(pois['weight'] > 3.0) & (pois['susc'] > 3)]
     num_crit = int(len(crit))
     sum_crit = float(crit['weight'].sum())
     theta = float(sum_crit / total_weight) if total_weight > 0 else 0.0

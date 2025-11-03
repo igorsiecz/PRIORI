@@ -1,3 +1,12 @@
+## [2.0.1] - 2025-11-03
+### Fixed
+- Resolved NoData-only outputs by hardening raster alignment prior to inference.
+### Performance
+- Reduced peak memory by building features on-the-fly only for valid pixels.
+- More predictable parallelism with simplified thread controls.
+- Chunked prediction to cap working-set size and stabilize runtime on large scenes.
+- Correct distance truncation in channel-distance computations, lowering compute cost without loss of fidelity.
+
 ## [2.0.0] - 2025-10-24
 ### Breaking changes
 - Susceptibility computation re-engineered using a Random Forest–based approach. Results are **not directly comparable** with v1.x.x.
